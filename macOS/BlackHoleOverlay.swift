@@ -387,11 +387,20 @@ private enum GeodesicLUT {
 }
 
 private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    // 捕获帧率：桌面内容与黑洞漂移都很慢，基础 30fps 捕获肉眼已无差，
+    // 却把 ScreenCaptureKit 的整屏抓取 + 色彩转换 CPU 开销直接对半砍；
+    // 空闲时进一步降到 15fps。捕获帧率与渲染帧率各自独立，由渲染器空闲逻辑统一驱动。
+    static let activeCaptureFPS = 30
+    static let idleCaptureFPS = 15
+
     private let frameQueue = DispatchQueue(label: "blackhole.screen-capture", qos: .userInteractive)
     private let stateLock = NSLock()
     private var latestPixelBuffer: CVPixelBuffer?
     private var stream: SCStream?
     private var generation: UInt64 = 0
+    // 保存 configuration 以便运行时通过 updateConfiguration 改捕获帧率（无需重建流）
+    private var configuration: SCStreamConfiguration?
+    private var currentCaptureFPS = 0
 
     func start(displayID: CGDirectDisplayID, width: Int, height: Int) async {
         let generation = stateLock.withLock {
@@ -419,7 +428,7 @@ private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDeleg
             let configuration = SCStreamConfiguration()
             configuration.width = width
             configuration.height = height
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(ScreenCaptureSource.activeCaptureFPS))
             configuration.queueDepth = 3
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
             configuration.showsCursor = false
@@ -431,6 +440,8 @@ private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDeleg
             let shouldStart = stateLock.withLock {
                 guard self.generation == generation else { return false }
                 self.stream = stream
+                self.configuration = configuration
+                self.currentCaptureFPS = ScreenCaptureSource.activeCaptureFPS
                 return true
             }
             guard shouldStart else { return }
@@ -461,11 +472,28 @@ private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDeleg
             let stream = self.stream
             self.stream = nil
             latestPixelBuffer = nil
+            configuration = nil
+            currentCaptureFPS = 0
             return stream
         }
         guard let stream else { return }
         Task {
             try? await stream.stopCapture()
+        }
+    }
+
+    // 运行时调整捕获帧率：仅在帧率变化时通过 updateConfiguration 生效（无需重建流）。
+    // 由渲染器的空闲逻辑驱动，与渲染帧率联动：活跃 30fps、空闲 15fps。
+    func updateCaptureFPS(_ fps: Int) {
+        let target: (stream: SCStream, configuration: SCStreamConfiguration)? = stateLock.withLock {
+            guard let stream, let configuration, currentCaptureFPS != fps else { return nil }
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+            currentCaptureFPS = fps
+            return (stream, configuration)
+        }
+        guard let target else { return }
+        Task {
+            try? await target.stream.updateConfiguration(target.configuration)
         }
     }
 
@@ -695,13 +723,18 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         // 体积仍在变，视为活跃以保持膨胀平滑。
         let idleSeconds = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .init(rawValue: ~0)!)
         let growing = growthRate > 0 && currentRadius < maxRadius
-        let targetFPS = (growing || idleSeconds < BlackHoleRenderer.idleThreshold)
-            ? BlackHoleRenderer.activeFPS
-            : BlackHoleRenderer.idleFPS
+        let active = growing || idleSeconds < BlackHoleRenderer.idleThreshold
+        let targetFPS = active ? BlackHoleRenderer.activeFPS : BlackHoleRenderer.idleFPS
         if targetFPS != currentFPS {
             currentFPS = targetFPS
             view.preferredFramesPerSecond = targetFPS
         }
+        // 捕获帧率随空闲状态联动：活跃时 30fps、空闲时 15fps。这是 CPU 占用的主项——
+        // ScreenCaptureKit 每帧整屏抓取 + 色彩转换，降捕获帧率比降渲染帧率更省 CPU。
+        // updateCaptureFPS 内部按帧率变化做幂等判断，未变化时不触发流重配。
+        captureSource.updateCaptureFPS(active
+            ? ScreenCaptureSource.activeCaptureFPS
+            : ScreenCaptureSource.idleCaptureFPS)
 
         let capturedWidth = Float(screenTexture?.width ?? 0)
         let capturedHeight = Float(screenTexture?.height ?? 0)
