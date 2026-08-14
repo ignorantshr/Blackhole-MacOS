@@ -267,6 +267,27 @@ private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDeleg
     }
 }
 
+// 共享渲染资源：Metal 设备与编译好的着色器 library 只在启动时创建一次，
+// 供所有屏幕的渲染器复用。避免每块屏幕都重复读取着色器源码并调用
+// makeLibrary(source:) 编译（一次编译约数百毫秒），减少多屏启动开销。
+private final class RenderResources {
+    let device: MTLDevice
+    let library: MTLLibrary
+
+    init() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw RendererError.noMetalDevice
+        }
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let shaderURL = executableURL.deletingLastPathComponent().appendingPathComponent("BlackHoleShaders.metal")
+        guard let shaderSource = try? String(contentsOf: shaderURL, encoding: .utf8) else {
+            throw RendererError.missingShaderSource(shaderURL.path)
+        }
+        self.device = device
+        self.library = try device.makeLibrary(source: shaderSource, options: nil)
+    }
+}
+
 private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
@@ -295,7 +316,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         Float.random(in: 0 ..< 1000)
     )
 
-    init(view: MTKView, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
+    init(view: MTKView, resources: RenderResources, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
         self.shadowRadius = shadowRadius
         self.driftSpeed = driftSpeed
         self.growthRate = growthRate
@@ -303,7 +324,8 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         // 增大上限对齐到 --size 的最大值：吸附能长到的最大体积，
         // 恰好等于手动能设的最大尺寸，概念统一，也兜住重采样 GPU 开销。
         self.maxRadius = BlackHoleSize.maxValue
-        guard let device = view.device, let commandQueue = device.makeCommandQueue() else {
+        let device = resources.device
+        guard let commandQueue = device.makeCommandQueue() else {
             throw RendererError.noMetalDevice
         }
         var textureCache: CVMetalTextureCache?
@@ -313,12 +335,8 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             throw RendererError.noTextureCache
         }
 
-        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-        let shaderURL = executableURL.deletingLastPathComponent().appendingPathComponent("BlackHoleShaders.metal")
-        guard let shaderSource = try? String(contentsOf: shaderURL, encoding: .utf8) else {
-            throw RendererError.missingShaderSource(shaderURL.path)
-        }
-        let library = try device.makeLibrary(source: shaderSource, options: nil)
+        // 复用启动时编译好的共享 library，不再逐屏读取源码重新编译
+        let library = resources.library
         guard let vertexFunction = library.makeFunction(name: "blackHoleVertex") else {
             throw RendererError.missingShaderFunction("blackHoleVertex")
         }
@@ -432,11 +450,9 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 private final class BlackHoleView: MTKView {
     private var blackHoleRenderer: BlackHoleRenderer?
 
-    init(blackHoleFrame frame: CGRect, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw RendererError.noMetalDevice
-        }
-        super.init(frame: frame, device: device)
+    init(blackHoleFrame frame: CGRect, resources: RenderResources, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
+        // 复用共享设备，不再逐屏调用 MTLCreateSystemDefaultDevice()
+        super.init(frame: frame, device: resources.device)
 
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColorMake(0, 0, 0, 0)
@@ -447,7 +463,7 @@ private final class BlackHoleView: MTKView {
         wantsLayer = true
         layer?.isOpaque = false
 
-        let renderer = try BlackHoleRenderer(view: self, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed, growthRate: growthRate)
+        let renderer = try BlackHoleRenderer(view: self, resources: resources, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed, growthRate: growthRate)
         blackHoleRenderer = renderer
         delegate = renderer
     }
@@ -470,6 +486,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let driftSpeed = DriftSpeed.parse(from: CommandLine.arguments)
     private let screenLimit = ScreenCount.parse(from: CommandLine.arguments)
     private let growthRate = GrowthRate.parse(from: CommandLine.arguments)
+    // 共享的 Metal 设备与编译好的着色器 library，启动时创建一次，供所有屏幕复用
+    private var renderResources: RenderResources?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -497,6 +515,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         captureSources.forEach { $0.stop() }
         captureSources = []
         windows.forEach { $0.orderOut(nil) }
+
+        // 编译一次共享着色器 library，之后所有屏幕复用（含显示器重排后重建窗口时）
+        let resources: RenderResources
+        do {
+            if let existing = renderResources {
+                resources = existing
+            } else {
+                resources = try RenderResources()
+                renderResources = resources
+            }
+        } catch {
+            fputs("Unable to prepare the Metal renderer: \(error.localizedDescription)\n", stderr)
+            NSApp.terminate(nil)
+            return
+        }
+
         // 限制渲染的屏幕数量：默认所有屏幕，--screens N 只取前 N 块
         let screens = screenLimit.map { Array(NSScreen.screens.prefix($0)) } ?? NSScreen.screens
         windows = screens.compactMap { screen in
@@ -529,6 +563,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
                 window.contentView = try BlackHoleView(
                     blackHoleFrame: NSRect(origin: .zero, size: screen.frame.size),
+                    resources: resources,
                     captureSource: captureSource,
                     shadowRadius: size,
                     driftSpeed: driftSpeed,
