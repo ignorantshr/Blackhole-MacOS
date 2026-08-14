@@ -33,6 +33,58 @@ private struct RenderUniforms {
     var time: Float
     var radius: Float
     var screenResolution: SIMD2<Float>
+    var seed: SIMD2<Float>
+    var driftSpeed: Float
+}
+
+// 把用户友好的 0-10 刻度线性映射到物理值：scale 5 对应默认观感。
+// 缺省或非法输入时返回 scale 5 对应的默认值。
+private func scaledOption(
+    from arguments: [String],
+    key: String,
+    lo: Float,
+    hi: Float
+) -> Float {
+    func mapScale(_ scale: Float) -> Float {
+        let clamped = min(max(scale, 0), 10)
+        return lo + (hi - lo) * (clamped / 10)
+    }
+    for (index, argument) in arguments.enumerated()
+    where argument == key && index + 1 < arguments.count {
+        if let scale = Float(arguments[index + 1]) {
+            return mapScale(scale)
+        }
+    }
+    return mapScale(5)
+}
+
+// 黑洞尺寸：--size [0-10]，映射到阴影半径占屏幕高度的比例 0.02-0.09（5→0.055）。
+// 数值越大，透镜场半径越大，GPU 采样开销越高。
+private enum BlackHoleSize {
+    static func parse(from arguments: [String]) -> Float {
+        scaledOption(from: arguments, key: "--size", lo: 0.02, hi: 0.09)
+    }
+}
+
+// 漂移速度：--speed [0-10]，映射到速度倍率 0-2.0（5→1.0），仅影响漫游，不影响吸积盘转速。
+private enum DriftSpeed {
+    static func parse(from arguments: [String]) -> Float {
+        scaledOption(from: arguments, key: "--speed", lo: 0.0, hi: 2.0)
+    }
+}
+
+// 渲染的屏幕数量：--screens N，限制在前 N 块显示器上渲染黑洞。
+// 至少 1 块，缺省或非法时返回 nil，表示所有屏幕。
+private enum ScreenCount {
+    static func parse(from arguments: [String]) -> Int? {
+        for (index, argument) in arguments.enumerated()
+        where argument == "--screens" && index + 1 < arguments.count {
+            if let value = Int(arguments[index + 1]) {
+                return max(value, 1)
+            }
+        }
+        return nil
+    }
 }
 
 private enum RendererError: LocalizedError {
@@ -185,8 +237,18 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let captureSource: ScreenCaptureSource
     private let textureCache: CVMetalTextureCache
     private let startTime = CACurrentMediaTime()
+    private let shadowRadius: Float
+    private let driftSpeed: Float
+    // 每个渲染器（每块屏幕）一个随机种子：seed.x 为随机相位，seed.y 为随机时间偏移，
+    // 令每块屏幕的漂移轨迹互不相同，且每次启动都不一样。
+    private let seed = SIMD2<Float>(
+        Float.random(in: 0 ..< (2 * Float.pi)),
+        Float.random(in: 0 ..< 1000)
+    )
 
-    init(view: MTKView, captureSource: ScreenCaptureSource) throws {
+    init(view: MTKView, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float) throws {
+        self.shadowRadius = shadowRadius
+        self.driftSpeed = driftSpeed
         guard let device = view.device, let commandQueue = device.makeCommandQueue() else {
             throw RendererError.noMetalDevice
         }
@@ -273,8 +335,10 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         var uniforms = RenderUniforms(
             resolution: SIMD2(Float(view.drawableSize.width), Float(view.drawableSize.height)),
             time: Float(CACurrentMediaTime() - startTime),
-            radius: 0.055,
-            screenResolution: SIMD2(capturedWidth, capturedHeight)
+            radius: shadowRadius,
+            screenResolution: SIMD2(capturedWidth, capturedHeight),
+            seed: seed,
+            driftSpeed: driftSpeed
         )
 
         encoder.setRenderPipelineState(pipelineState)
@@ -291,7 +355,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 private final class BlackHoleView: MTKView {
     private var blackHoleRenderer: BlackHoleRenderer?
 
-    init(blackHoleFrame frame: CGRect, captureSource: ScreenCaptureSource) throws {
+    init(blackHoleFrame frame: CGRect, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw RendererError.noMetalDevice
         }
@@ -306,7 +370,7 @@ private final class BlackHoleView: MTKView {
         wantsLayer = true
         layer?.isOpaque = false
 
-        let renderer = try BlackHoleRenderer(view: self, captureSource: captureSource)
+        let renderer = try BlackHoleRenderer(view: self, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed)
         blackHoleRenderer = renderer
         delegate = renderer
     }
@@ -325,6 +389,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureSources: [ScreenCaptureSource] = []
     private var quitHotKey: EventHotKeyRef?
     private var quitHotKeyHandler: EventHandlerRef?
+    private let size = BlackHoleSize.parse(from: CommandLine.arguments)
+    private let driftSpeed = DriftSpeed.parse(from: CommandLine.arguments)
+    private let screenLimit = ScreenCount.parse(from: CommandLine.arguments)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -352,7 +419,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         captureSources.forEach { $0.stop() }
         captureSources = []
         windows.forEach { $0.orderOut(nil) }
-        windows = NSScreen.screens.compactMap { screen in
+        // 限制渲染的屏幕数量：默认所有屏幕，--screens N 只取前 N 块
+        let screens = screenLimit.map { Array(NSScreen.screens.prefix($0)) } ?? NSScreen.screens
+        windows = screens.compactMap { screen in
             do {
                 guard let screenNumber = screen.deviceDescription[
                     NSDeviceDescriptionKey("NSScreenNumber")
@@ -382,7 +451,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
                 window.contentView = try BlackHoleView(
                     blackHoleFrame: NSRect(origin: .zero, size: screen.frame.size),
-                    captureSource: captureSource
+                    captureSource: captureSource,
+                    shadowRadius: size,
+                    driftSpeed: driftSpeed
                 )
                 window.orderFrontRegardless()
                 captureSources.append(captureSource)

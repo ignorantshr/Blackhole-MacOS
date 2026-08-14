@@ -66,6 +66,8 @@ struct RenderUniforms {
     float time;
     float radius;
     float2 screenResolution;
+    float2 seed;        // 每块屏幕独立的随机相位，令漂移轨迹各不相同且不同步
+    float driftSpeed;   // 黑洞漂移速度倍率，仅影响漫游，不影响吸积盘转速
 };
 
 struct VertexOutput {
@@ -150,11 +152,12 @@ float3 starfield(float3 direction, float time) {
     return tint * spark * twinkle * ((h - 0.92) / 0.08);
 }
 
-// 不规则的 Lissajous 漫游：每个轴 2+2 个不可公度正弦，轨迹不会明显重复
-float2 lissajous(float t) {
+// 不规则的 Lissajous 漫游：每个轴 2+2 个不可公度正弦，轨迹不会明显重复。
+// phase 为每块屏幕独立的随机相位，令各屏轨迹互不相同、互不同步。
+float2 lissajous(float t, float2 phase) {
     return float2(
-        0.75 * sin(t * 0.37) + 0.25 * sin(t * 0.83 + 1.0),
-        0.70 * sin(t * 0.54 + 2.1) + 0.30 * sin(t * 1.07)
+        0.75 * sin(t * 0.37 + phase.x) + 0.25 * sin(t * 0.83 + 1.0 + phase.y),
+        0.70 * sin(t * 0.54 + 2.1 + phase.y) + 0.30 * sin(t * 1.07 + phase.x)
     );
 }
 
@@ -167,7 +170,10 @@ fragment float4 blackHoleFragment(
     float2 uv = input.position.xy / uniforms.resolution;
     float aspect = uniforms.resolution.x / uniforms.resolution.y;
     bool hasScreen = all(uniforms.screenResolution > 0.0);
-    float time = uniforms.time * kDriftSpeed;
+    // time 为原始时间，驱动吸积盘旋转等物理动画，不受漂移速度影响
+    float time = uniforms.time;
+    // 漫游用的时间轴：基础漂移速度 × 用户可调倍率
+    float driftClock = uniforms.time * kDriftSpeed * uniforms.driftSpeed;
 
     // 盘的径向范围做一次保护：内边缘保持在光子球（1.5 r_s）之外，
     // 在光子球以内圆轨道已不再有物理意义
@@ -184,9 +190,14 @@ fragment float4 blackHoleFragment(
     float2 room = max((high - low) * 0.5, float2(0.0));
     float2 wobbleAmplitude = min(float2(0.02), max(room * 0.3, float2(0.004)));
     float2 driftAmplitude = max(room - wobbleAmplitude, float2(0.0));
+    // seed.x 作为随机相位，seed.y 作为随机时间偏移：每次启动、每块屏幕
+    // 都从轨迹的不同位置出发，各屏互不同步。
+    float2 phase = float2(uniforms.seed.x, uniforms.seed.x + 1.7);
+    float driftTime = driftClock + uniforms.seed.y;
     float2 center = (low + high) * 0.5
-        + lissajous(time * 0.35) * driftAmplitude
-        + wobbleAmplitude * float2(cos(time * 0.8), sin(time * 1.0));
+        + lissajous(driftTime * 0.35, phase) * driftAmplitude
+        + wobbleAmplitude * float2(cos(driftTime * 0.8 + uniforms.seed.x),
+                                   sin(driftTime * 1.0 + uniforms.seed.x));
 
     // 以黑洞为中心、按宽高比校正的坐标系（y 以屏幕高度为单位）
     float2 p = (uv - center) * float2(aspect, 1.0);

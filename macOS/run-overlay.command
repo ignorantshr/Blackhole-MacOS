@@ -10,4 +10,5 @@ if [[ ! -x .build/BlackHoleOverlay || BlackHoleOverlay.swift -nt .build/BlackHol
     -framework MetalKit -framework QuartzCore -framework ScreenCaptureKit \
     BlackHoleOverlay.swift -o .build/BlackHoleOverlay
 fi
-exec .build/BlackHoleOverlay
+# 透传控制参数，例如：run-overlay.command --size 7 --speed 8 --screens 1
+exec .build/BlackHoleOverlay "$@"
