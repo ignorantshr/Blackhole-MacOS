@@ -360,13 +360,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     return nil
                 }
                 let captureSource = ScreenCaptureSource()
+                // screen.frame 是全局坐标。NSWindow 的 screen: 参数会把 contentRect
+                // 当作该屏幕的相对坐标再加上屏幕原点，传入两者会让原点被叠加一次：
+                // 副屏 (-121,1117) 会变成 (-242,2234)，窗口几乎完全移出该屏幕，
+                // 只剩顶部一条与屏幕相交。这里传 nil，让 contentRect 保持全局坐标。
                 let window = NSWindow(
                     contentRect: screen.frame,
                     styleMask: .borderless,
                     backing: .buffered,
                     defer: false,
-                    screen: screen
+                    screen: nil
                 )
+                // 显示器重新排列时 AppKit 可能自行搬动窗口，这里再钉一次几何
+                window.setFrame(screen.frame, display: false)
                 window.isOpaque = false
                 window.backgroundColor = .clear
                 window.hasShadow = false
