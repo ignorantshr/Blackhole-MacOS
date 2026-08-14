@@ -38,7 +38,7 @@ constant float kDiskWind    = 7.0;    // 条纹螺旋缠绕紧密度
 constant float kDiskContrast = 1.6;   // 条纹对比度：0 为平滑雾状，越大越锐利
 // 光照与屏幕
 constant float kExposure    = 1.4;    // 盘光的色调映射曝光（桌面像素本身不受影响）
-constant float kDriftSpeed  = 1.0;    // 黑洞漂移速度
+constant float kDriftSpeed  = 0.5;    // 黑洞漂移基础速度（统一缩放整个 --speed 范围）
 // 有界重采样场（单位为测地线近场半径的倍数，默认近场半径约 4.2 个阴影半径）。
 // 三者必须满足 kLensReach < kFieldWarp < kFieldOuter：位移要先严格归零，
 // 覆盖才能归零，否则边界会把畸变后的桌面与实时桌面交叉淡化而产生重影。

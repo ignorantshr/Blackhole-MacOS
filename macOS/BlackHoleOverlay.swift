@@ -281,6 +281,13 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let maxRadius: Float
     private var currentRadius: Float
     private var lastGrowthTime = CACurrentMediaTime()
+    // 输入空闲降帧：用户超过 idleThreshold 秒无鼠标/键盘操作时降到 idleFPS 省电，
+    // 一有输入立刻回到 activeFPS。黑洞漂移与吸积盘旋转是时间驱动的，降帧只影响
+    // 平滑度、不改变动画速度，因此空闲时仍连续动，只是每秒少渲染几帧。
+    private static let activeFPS = 60
+    private static let idleFPS = 30
+    private static let idleThreshold = 5.0   // 无输入超过此秒数即判为空闲
+    private var currentFPS = 0
     // 每个渲染器（每块屏幕）一个随机种子：seed.x 为随机相位，seed.y 为随机时间偏移，
     // 令每块屏幕的漂移轨迹互不相同，且每次启动都不一样。
     private let seed = SIMD2<Float>(
@@ -385,6 +392,19 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         if growthRate > 0 && currentRadius < maxRadius {
             currentRadius += (maxRadius - currentRadius) * growthRate * dt
             currentRadius = min(currentRadius, maxRadius)
+        }
+
+        // 静止降帧：按全局输入空闲时间判断。距上次鼠标/键盘操作超过 idleThreshold
+        // 秒就降到 idleFPS 省电，一有输入立刻回到 activeFPS。吸附增大过程中黑洞
+        // 体积仍在变，视为活跃以保持膨胀平滑。
+        let idleSeconds = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .init(rawValue: ~0)!)
+        let growing = growthRate > 0 && currentRadius < maxRadius
+        let targetFPS = (growing || idleSeconds < BlackHoleRenderer.idleThreshold)
+            ? BlackHoleRenderer.activeFPS
+            : BlackHoleRenderer.idleFPS
+        if targetFPS != currentFPS {
+            currentFPS = targetFPS
+            view.preferredFramesPerSecond = targetFPS
         }
 
         let capturedWidth = Float(screenTexture?.width ?? 0)
