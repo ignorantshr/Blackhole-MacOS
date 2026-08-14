@@ -83,3 +83,9 @@
 - `macOS/BlackHoleOverlay.swift`：透明覆盖窗口、ScreenCaptureKit 捕获、Metal 渲染管线与多屏管理
 - `macOS/BlackHoleShaders.metal`：Schwarzschild 测地线积分、吸积盘、光子环着色器，黑洞周围有界重采样场，以及逃逸偏折与吸积盘穿越的两级查找表快路径
 - `macOS/run-overlay.command`：自动构建和启动脚本
+
+## 许可与致谢
+
+本项目以 MIT 协议发布，详见 [`LICENSE`](LICENSE)。
+
+黑洞的视觉与物理模型（数值积分 Schwarzschild 零测地线、Binet 形式光子加速度、薄开普勒吸积盘、相对论多普勒与集束）改编自 [ghostty-blackhole](https://github.com/s0xDk/ghostty-blackhole)（MIT 协议）。作为衍生作品，上游的完整版权与许可声明原样收录于 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。感谢原作者的开源工作。

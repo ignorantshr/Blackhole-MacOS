@@ -3,8 +3,9 @@ using namespace metal;
 
 // 物理黑洞覆盖层着色器
 //
-// 视觉模型参考 ghostty-blackhole（Eric Bruneton 的实时黑洞渲染），
-// 但这里不使用预计算查找纹理：每个像素直接数值积分 Schwarzschild 零测地线。
+// 视觉模型改编自 ghostty-blackhole（https://github.com/s0xDk/ghostty-blackhole，
+// MIT 协议，版权见仓库根目录 THIRD-PARTY-NOTICES.md）：核心是每个像素直接数值
+// 积分 Schwarzschild 零测地线（下方两级查找表只是对该积分的等价加速，见 README）。
 // Binet 形式的光子加速度  a = -(3/2) h^2 x / r^5  精确复现史瓦西偏折，
 // 因此以下现象全部来自积分本身，而不是叠加绘制的贴图：
 //
