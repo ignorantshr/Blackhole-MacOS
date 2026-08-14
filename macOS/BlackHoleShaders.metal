@@ -257,14 +257,22 @@ fragment float4 blackHoleFragment(
             * max(kLensDepth - 2.14 * u + 0.75, 0.0)
             * window;
         float2 direction = p / max(pixelRadius, 1e-5);
-        float3 lensed = float3(0.0);
+        float3 lensed;
         // 轻微色散：蓝光比红光多弯折一点，远离交接圆后淡出（测地线一侧不做色散）
         float aberration = 0.035 * smoothstep(1.0, 2.0, impactParameter / maxImpact);
-        for (int i = 0; i < 3; i++) {
-            float k = 1.0 + (float(i) - 1.0) * aberration;
-            float2 sampleOffset = p - direction * deflection * k;
+        if (aberration < 1e-4) {
+            // 交接圆附近色散为 0，三通道偏折相同，采一次即可（省 2 次纹理采样）
+            float2 sampleOffset = p - direction * deflection;
             float2 sampleUV = mirrorUV(center + sampleOffset / float2(aspect, 1.0));
-            lensed[i] = screenTexture.sample(screenSampler, sampleUV)[i];
+            lensed = screenTexture.sample(screenSampler, sampleUV).rgb;
+        } else {
+            lensed = float3(0.0);
+            for (int i = 0; i < 3; i++) {
+                float k = 1.0 + (float(i) - 1.0) * aberration;
+                float2 sampleOffset = p - direction * deflection * k;
+                float2 sampleUV = mirrorUV(center + sampleOffset / float2(aspect, 1.0));
+                lensed[i] = screenTexture.sample(screenSampler, sampleUV)[i];
+            }
         }
         // 与测地线区域共用同一星场，经弱场偏折照亮，避免星点在边界圆突然出现
         float3 skyDirection = normalize(float3(-(rayPoint / impactParameter) * (2.0 / impactParameter), -1.0));
@@ -281,6 +289,10 @@ fragment float4 blackHoleFragment(
     float3 position = float3(rayPoint, cameraDistance);
     float3 velocity = float3(0.0, 0.0, -1.0);
     float angularMomentumSquared = dot(rayPoint, rayPoint);
+    // 加速度 a = -(3/2) h^2 x / r^5 里的常量系数，整条光线不变，提到循环外
+    float accelCoeff = -1.5 * angularMomentumSquared;
+    // 远逃判据的比较值也是常量，避免每步重算
+    float farBound = 4.0 * cameraDistance * cameraDistance;
 
     // 盘平面：法线绕屏幕 x 轴倾斜 kDiskIncl
     float cosIncl = cos(kDiskIncl);
@@ -305,22 +317,26 @@ fragment float4 blackHoleFragment(
         if (position.z < -cameraDistance && velocity.z < 0.0) {  // 从后方逃逸
             break;
         }
-        if (radiusSquared > 4.0 * cameraDistance * cameraDistance) { // 被甩向远处
+        if (radiusSquared > farBound) {                     // 被甩向远处
             break;
         }
-        float radius = sqrt(radiusSquared);
+        // 1/r 用 rsqrt 求，避免 sqrt + 除法：a = accelCoeff * x / r^5 = accelCoeff * x * (1/r)^5
+        float invRadius = rsqrt(radiusSquared);
+        float radius = radiusSquared * invRadius;           // = sqrt(radiusSquared)
         // 步长随半径变化：光子球附近细，远处粗（偏折按 1/r^4 衰减，
         // 远处放大步长可把 N_STEPS 预算留给强弯曲区域）
         float stepSize = clamp(0.16 * radius, 0.03, 1.5);
         // 蛙跳积分（kick-drift-kick）能让接近临界的轨道保持稳定
-        float3 acceleration = -1.5 * angularMomentumSquared * position
-            / (radiusSquared * radiusSquared * radius);
+        float invRadius5 = invRadius * invRadius;
+        invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
+        float3 acceleration = accelCoeff * position * invRadius5;
         velocity += acceleration * (0.5 * stepSize);
         position += velocity * stepSize;
         radiusSquared = dot(position, position);
-        radius = sqrt(radiusSquared);
-        acceleration = -1.5 * angularMomentumSquared * position
-            / (radiusSquared * radiusSquared * radius);
+        invRadius = rsqrt(radiusSquared);
+        invRadius5 = invRadius * invRadius;
+        invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
+        acceleration = accelCoeff * position * invRadius5;
         velocity += acceleration * (0.5 * stepSize);
 
         // ---- 薄盘穿越：光线穿过了盘平面 ----
