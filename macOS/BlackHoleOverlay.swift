@@ -58,11 +58,31 @@ private func scaledOption(
     return mapScale(5)
 }
 
-// 黑洞尺寸：--size [0-10]，映射到阴影半径占屏幕高度的比例 0.02-0.09（5→0.055）。
+// 黑洞尺寸：--size [0-10]，映射到阴影半径占屏幕高度的比例。
+// 采用分段线性，锚定三点：0→minValue、5→midValue、10→maxValue，
+// 让刻度 5 稳定保持默认观感，同时把上半段拉到更大的上限。
 // 数值越大，透镜场半径越大，GPU 采样开销越高。
 private enum BlackHoleSize {
+    static let minValue: Float = 0.02
+    static let midValue: Float = 0.055   // 刻度 5，历史默认观感
+    static let maxValue: Float = 0.16    // 刻度 10，约屏高的一半
+
     static func parse(from arguments: [String]) -> Float {
-        scaledOption(from: arguments, key: "--size", lo: 0.02, hi: 0.09)
+        for (index, argument) in arguments.enumerated()
+        where argument == "--size" && index + 1 < arguments.count {
+            if let scale = Float(arguments[index + 1]) {
+                return mapScale(scale)
+            }
+        }
+        return mapScale(5)
+    }
+
+    private static func mapScale(_ scale: Float) -> Float {
+        let clamped = min(max(scale, 0), 10)
+        if clamped <= 5 {
+            return minValue + (midValue - minValue) * (clamped / 5)
+        }
+        return midValue + (maxValue - midValue) * ((clamped - 5) / 5)
     }
 }
 
@@ -84,6 +104,22 @@ private enum ScreenCount {
             }
         }
         return nil
+    }
+}
+
+// 吸附增大速率：--growth [0-10]，控制黑洞随时间“吞噬”桌面而膨胀的快慢。
+// 默认 0（关闭，尺寸恒定）；数值越大，半径逼近上限越快。
+private enum GrowthRate {
+    static func parse(from arguments: [String]) -> Float {
+        for (index, argument) in arguments.enumerated()
+        where argument == "--growth" && index + 1 < arguments.count {
+            if let value = Float(arguments[index + 1]) {
+                // 映射到指数增长速率（1/秒）。时间常数 τ = 1/rate：
+                // 10→rate 0.05（τ≈20 秒），逼近上限约需 1 分钟；0→关闭。
+                return min(max(value, 0), 10) / 10 * 0.05
+            }
+        }
+        return 0
     }
 }
 
@@ -239,6 +275,12 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let startTime = CACurrentMediaTime()
     private let shadowRadius: Float
     private let driftSpeed: Float
+    // 吸附增大：growthRate 为 [0,1] 速率（0 关闭）；黑洞半径随时间从初始值
+    // 渐近逼近上限，模拟持续吞噬桌面而膨胀。上限同时兜住 GPU 采样开销。
+    private let growthRate: Float
+    private let maxRadius: Float
+    private var currentRadius: Float
+    private var lastGrowthTime = CACurrentMediaTime()
     // 每个渲染器（每块屏幕）一个随机种子：seed.x 为随机相位，seed.y 为随机时间偏移，
     // 令每块屏幕的漂移轨迹互不相同，且每次启动都不一样。
     private let seed = SIMD2<Float>(
@@ -246,9 +288,14 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         Float.random(in: 0 ..< 1000)
     )
 
-    init(view: MTKView, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float) throws {
+    init(view: MTKView, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
         self.shadowRadius = shadowRadius
         self.driftSpeed = driftSpeed
+        self.growthRate = growthRate
+        self.currentRadius = shadowRadius
+        // 增大上限对齐到 --size 的最大值：吸附能长到的最大体积，
+        // 恰好等于手动能设的最大尺寸，概念统一，也兜住重采样 GPU 开销。
+        self.maxRadius = BlackHoleSize.maxValue
         guard let device = view.device, let commandQueue = device.makeCommandQueue() else {
             throw RendererError.noMetalDevice
         }
@@ -330,12 +377,22 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // 吸附增大：按帧间 dt 累积（与帧率无关），半径以指数方式渐近逼近上限。
+        // growthRate 为 0 时保持初始半径不变。
+        let now = CACurrentMediaTime()
+        let dt = Float(min(max(now - lastGrowthTime, 0), 0.1))
+        lastGrowthTime = now
+        if growthRate > 0 && currentRadius < maxRadius {
+            currentRadius += (maxRadius - currentRadius) * growthRate * dt
+            currentRadius = min(currentRadius, maxRadius)
+        }
+
         let capturedWidth = Float(screenTexture?.width ?? 0)
         let capturedHeight = Float(screenTexture?.height ?? 0)
         var uniforms = RenderUniforms(
             resolution: SIMD2(Float(view.drawableSize.width), Float(view.drawableSize.height)),
-            time: Float(CACurrentMediaTime() - startTime),
-            radius: shadowRadius,
+            time: Float(now - startTime),
+            radius: currentRadius,
             screenResolution: SIMD2(capturedWidth, capturedHeight),
             seed: seed,
             driftSpeed: driftSpeed
@@ -355,7 +412,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 private final class BlackHoleView: MTKView {
     private var blackHoleRenderer: BlackHoleRenderer?
 
-    init(blackHoleFrame frame: CGRect, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float) throws {
+    init(blackHoleFrame frame: CGRect, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw RendererError.noMetalDevice
         }
@@ -370,7 +427,7 @@ private final class BlackHoleView: MTKView {
         wantsLayer = true
         layer?.isOpaque = false
 
-        let renderer = try BlackHoleRenderer(view: self, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed)
+        let renderer = try BlackHoleRenderer(view: self, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed, growthRate: growthRate)
         blackHoleRenderer = renderer
         delegate = renderer
     }
@@ -392,6 +449,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let size = BlackHoleSize.parse(from: CommandLine.arguments)
     private let driftSpeed = DriftSpeed.parse(from: CommandLine.arguments)
     private let screenLimit = ScreenCount.parse(from: CommandLine.arguments)
+    private let growthRate = GrowthRate.parse(from: CommandLine.arguments)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -453,7 +511,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     blackHoleFrame: NSRect(origin: .zero, size: screen.frame.size),
                     captureSource: captureSource,
                     shadowRadius: size,
-                    driftSpeed: driftSpeed
+                    driftSpeed: driftSpeed,
+                    growthRate: growthRate
                 )
                 window.orderFrontRegardless()
                 captureSources.append(captureSource)
