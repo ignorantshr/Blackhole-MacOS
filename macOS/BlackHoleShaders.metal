@@ -59,6 +59,13 @@ constant float kFieldOuter  = 2.05;   // 覆盖归零处，向外即完全透明
 // 它同时也是远处观测到的阴影视半径。属于物理常量，不是风格参数。
 #define B_CRIT 2.5980762
 
+// 预计算逃逸测地线查找表的维度，必须与 BlackHoleOverlay.swift 的
+// GeodesicLUT.lensSamples / gateAzimuths 完全一致（改一处要同步另一处）。
+//   kLensSamples —— 透镜表条目数，b 在 [B_CRIT, maxImpact] 上等距采样
+//   kGateAzimuths —— 盘门控表方位桶数
+#define kLensSamples 1024
+#define kGateAzimuths 180
+
 constant float pi = 3.14159265359;
 
 struct RenderUniforms {
@@ -161,9 +168,44 @@ float2 lissajous(float t, float2 phase) {
     );
 }
 
+// ------------------------------------------------------ 预计算查找表 --
+// 逃逸测地线的终点状态是冲击参数 b 的一元函数（史瓦西中心力场 → 平面运动）。
+// 主机端已在 [B_CRIT, maxImpact] 上把它制成一维表：每格 (px, pz, dx, dz)，
+// 其中 (px, pz) 是光线在自身 2D 轨道平面内的终点位置（px 为横向、初始沿 +b 方向），
+// (dx, dz) 是归一化终点方向。这里线性插值取回该状态。
+struct LensSample { float px; float pz; float dx; float dz; };
+
+LensSample sampleLensTable(constant float4 *lensTable, float impactParameter) {
+    float f = (impactParameter - B_CRIT) / (11.0 - B_CRIT) * float(kLensSamples - 1);
+    f = clamp(f, 0.0, float(kLensSamples - 1));
+    int i0 = int(floor(f));
+    int i1 = min(i0 + 1, kLensSamples - 1);
+    float frac = f - float(i0);
+    float4 a = lensTable[i0];
+    float4 b = lensTable[i1];
+    float4 s = mix(a, b, frac);
+    LensSample out;
+    out.px = s.x; out.pz = s.y; out.dx = s.z; out.dz = s.w;
+    return out;
+}
+
+// 盘门控：给定像素在盘系（已施加滚转）里的方位角与冲击参数，判断这条光线是否
+// “保证碰不到吸积盘”。碰不到 → 可跳过 48 步积分直接查透镜表；否则仍需完整积分。
+// gateTable[方位桶] = (loB, hiB)：只有 b∈[loB,hiB] 才可能穿盘（主机端已保守外扩）。
+bool rayMissesDisk(constant float2 *gateTable, float azimuth, float impactParameter) {
+    float a = azimuth;
+    if (a < 0.0) { a += 2.0 * pi; }
+    int bucket = int(a / (2.0 * pi) * float(kGateAzimuths));
+    bucket = clamp(bucket, 0, kGateAzimuths - 1);
+    float2 span = gateTable[bucket];
+    return impactParameter < span.x || impactParameter > span.y;
+}
+
 fragment float4 blackHoleFragment(
     VertexOutput input [[stage_in]],
     constant RenderUniforms &uniforms [[buffer(0)]],
+    constant float4 *lensTable [[buffer(1)]],   // 逃逸测地线终点：(px, pz, dx, dz)，b 等距采样
+    constant float2 *gateTable [[buffer(2)]],   // 盘门控：每方位 (loB, hiB) 冲击参数区间
     texture2d<float> screenTexture [[texture(0)]]
 ) {
     constexpr sampler screenSampler(coord::normalized, address::clamp_to_edge, filter::linear);
@@ -282,113 +324,129 @@ fragment float4 blackHoleFragment(
         return float4(farField * coverage, coverage);
     }
 
-    // ========================= 近场：积分测地线 =========================
+    // ========================= 近场：积分测地线（或查表快路径）=========================
     // 来自远处相机（+z 方向）的平行光线。黑洞位于原点，r_s = 1。
     // 积分 x'' = -(3/2) h^2 x / r^5（精确的史瓦西光子偏折）；
     // h = |x×v| 是守恒量，只需计算一次。
     float3 position = float3(rayPoint, cameraDistance);
     float3 velocity = float3(0.0, 0.0, -1.0);
-    float angularMomentumSquared = dot(rayPoint, rayPoint);
-    // 加速度 a = -(3/2) h^2 x / r^5 里的常量系数，整条光线不变，提到循环外
-    float accelCoeff = -1.5 * angularMomentumSquared;
-    // 远逃判据的比较值也是常量，避免每步重算
-    float farBound = 4.0 * cameraDistance * cameraDistance;
-
-    // 盘平面：法线绕屏幕 x 轴倾斜 kDiskIncl
-    float cosIncl = cos(kDiskIncl);
-    float sinIncl = sin(kDiskIncl);
-    float3 diskNormal = float3(0.0, sinIncl, cosIncl);
-    float3 diskAxis = float3(0.0, cosIncl, -sinIncl); // 与 (x̂, diskAxis, diskNormal) 构成正交系
-    float spinDirection = kDiskSpeed < 0.0 ? -1.0 : 1.0;
-    float spinSpeed = abs(kDiskSpeed);
-
     float3 emission = float3(0.0);   // 累积的盘光（HDR）
     float transmittance = 1.0;       // 朝向背景的透过率
     bool captured = false;
-    float planeDistancePrev = dot(position, diskNormal);
-    float3 positionPrev = position;
 
-    for (int i = 0; i < N_STEPS; i++) {
-        float radiusSquared = dot(position, position);
-        if (radiusSquared < 1.0) {                          // 穿过视界
-            captured = true;
-            break;
-        }
-        if (position.z < -cameraDistance && velocity.z < 0.0) {  // 从后方逃逸
-            break;
-        }
-        if (radiusSquared > farBound) {                     // 被甩向远处
-            break;
-        }
-        // 1/r 用 rsqrt 求，避免 sqrt + 除法：a = accelCoeff * x / r^5 = accelCoeff * x * (1/r)^5
-        float invRadius = rsqrt(radiusSquared);
-        float radius = radiusSquared * invRadius;           // = sqrt(radiusSquared)
-        // 步长随半径变化：光子球附近细，远处粗（偏折按 1/r^4 衰减，
-        // 远处放大步长可把 N_STEPS 预算留给强弯曲区域）
-        float stepSize = clamp(0.16 * radius, 0.03, 1.5);
-        // 蛙跳积分（kick-drift-kick）能让接近临界的轨道保持稳定
-        float invRadius5 = invRadius * invRadius;
-        invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
-        float3 acceleration = accelCoeff * position * invRadius5;
-        velocity += acceleration * (0.5 * stepSize);
-        position += velocity * stepSize;
-        radiusSquared = dot(position, position);
-        invRadius = rsqrt(radiusSquared);
-        invRadius5 = invRadius * invRadius;
-        invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
-        acceleration = accelCoeff * position * invRadius5;
-        velocity += acceleration * (0.5 * stepSize);
+    // 查表快路径判据：冲击参数在查找表定义域内（b ≥ B_CRIT，即阴影核心之外，
+    // 恒逃逸不被捕获），且盘门控保证这条光线碰不到吸积盘。两者同时成立时，
+    // 逃逸终点是 b 的一元函数，可直接查透镜表，省掉整段 48 步积分与盘穿越判定。
+    // 阴影核心（b < B_CRIT）以及可能穿盘的光线仍走下方完整积分。
+    float rayAzimuth = atan2(rayPoint.y, rayPoint.x);
+    bool useLensTable = impactParameter >= B_CRIT
+        && rayMissesDisk(gateTable, rayAzimuth, impactParameter);
 
-        // ---- 薄盘穿越：光线穿过了盘平面 ----
-        float planeDistance = dot(position, diskNormal);
-        if (planeDistance * planeDistancePrev < 0.0 && transmittance > 0.02) {
-            float crossFraction = planeDistancePrev / (planeDistancePrev - planeDistance);
-            float3 crossPoint = mix(positionPrev, position, crossFraction);
-            float crossRadius = length(crossPoint);
-            if (crossRadius > diskInner && crossRadius < diskOuter) {
-                float band = smoothstep(diskInner, diskInner * 1.25, crossRadius)
-                    * (1.0 - smoothstep(diskOuter * 0.70, diskOuter, crossRadius));
+    if (useLensTable) {
+        // 查表并把平面内终点状态沿像素方位旋转回 3D（中心力场 → 平面运动）
+        LensSample ls = sampleLensTable(lensTable, impactParameter);
+        float2 radial = rayPoint / max(impactParameter, 1e-5);
+        position = float3(radial * ls.px, ls.pz);
+        velocity = float3(radial * ls.dx, ls.dz);   // 已归一化
+    } else {
+        // 加速度 a = -(3/2) h^2 x / r^5 里的常量系数，整条光线不变，提到循环外
+        float accelCoeff = -1.5 * dot(rayPoint, rayPoint);
+        // 远逃判据的比较值也是常量，避免每步重算
+        float farBound = 4.0 * cameraDistance * cameraDistance;
 
-                // 盘平面极坐标，用于条纹纹理
-                float phi = atan2(dot(crossPoint, diskAxis), crossPoint.x);
-                float turns = phi / (2.0 * pi);
-                float keplerRate = pow(diskInner / crossRadius, 1.5);
-                // √(1 − 1.5/r)：内侧轨道时间流逝更慢，图案在内边缘明显凝滞
-                float gravitationalFactor = sqrt(max(1.0 - 1.5 / crossRadius, 0.02));
-                float swirl = crossRadius * kDiskWind * 0.12
-                    - time * keplerRate * spinSpeed * gravitationalFactor * spinDirection;
-                float streaks =
-                    valueNoiseWrapY(float2(crossRadius * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65 +
-                    valueNoiseWrapY(float2(crossRadius * 1.0, turns * 9.0 + swirl * 1.5 + 7.0), 9.0) * 0.35;
-                streaks = 0.35 + kDiskContrast * streaks * streaks;
+        // 盘平面：法线绕屏幕 x 轴倾斜 kDiskIncl
+        float cosIncl = cos(kDiskIncl);
+        float sinIncl = sin(kDiskIncl);
+        float3 diskNormal = float3(0.0, sinIncl, cosIncl);
+        float3 diskAxis = float3(0.0, cosIncl, -sinIncl); // 与 (x̂, diskAxis, diskNormal) 构成正交系
+        float spinDirection = kDiskSpeed < 0.0 ? -1.0 : 1.0;
+        float spinSpeed = abs(kDiskSpeed);
 
-                // 圆轨道气体的相对论多普勒 + 引力红移：
-                // g = √(1 − 1.5/r) / (1 − β·k̂)，光子方向直接取自当前光线
-                float3 gasDirection = normalize(cross(diskNormal, crossPoint)) * spinDirection;
-                float beta = clamp(rsqrt(max(2.0 * (crossRadius - 1.0), 0.2)), 0.0, 0.99);
-                float shift = gravitationalFactor
-                    / max(1.0 + beta * dot(gasDirection, normalize(velocity)), 0.05);
-                shift = mix(1.0, shift, kDopplerMix);
+        float planeDistancePrev = dot(position, diskNormal);
+        float3 positionPrev = position;
 
-                // Shakura–Sunyaev 温度剖面，峰值归一化到 1
-                float temperatureEdge = max(1.0 - sqrt(diskInner / crossRadius), 0.0);
-                float temperatureProfile = pow(diskInner / crossRadius, 0.75)
-                    * pow(temperatureEdge, 0.25) / 0.488;
-                float3 diskColor = blackbody(kDiskTemp * temperatureProfile * shift); // 多普勒偏色
-                float boost = pow(shift, kDiskBeam);                                  // 相对论集束
-
-                float density = band * streaks;
-                emission += transmittance * diskColor
-                    * (kDiskGain * 2.2 * density * temperatureProfile * temperatureProfile * boost);
-                transmittance *= 1.0 - clamp(kDiskOpacity * density, 0.0, 1.0);
+        for (int i = 0; i < N_STEPS; i++) {
+            float radiusSquared = dot(position, position);
+            if (radiusSquared < 1.0) {                          // 穿过视界
+                captured = true;
+                break;
             }
+            if (position.z < -cameraDistance && velocity.z < 0.0) {  // 从后方逃逸
+                break;
+            }
+            if (radiusSquared > farBound) {                     // 被甩向远处
+                break;
+            }
+            // 1/r 用 rsqrt 求，避免 sqrt + 除法：a = accelCoeff * x / r^5 = accelCoeff * x * (1/r)^5
+            float invRadius = rsqrt(radiusSquared);
+            float radius = radiusSquared * invRadius;           // = sqrt(radiusSquared)
+            // 步长随半径变化：光子球附近细，远处粗（偏折按 1/r^4 衰减，
+            // 远处放大步长可把 N_STEPS 预算留给强弯曲区域）
+            float stepSize = clamp(0.16 * radius, 0.03, 1.5);
+            // 蛙跳积分（kick-drift-kick）能让接近临界的轨道保持稳定
+            float invRadius5 = invRadius * invRadius;
+            invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
+            float3 acceleration = accelCoeff * position * invRadius5;
+            velocity += acceleration * (0.5 * stepSize);
+            position += velocity * stepSize;
+            radiusSquared = dot(position, position);
+            invRadius = rsqrt(radiusSquared);
+            invRadius5 = invRadius * invRadius;
+            invRadius5 = invRadius5 * invRadius5 * invRadius;   // (1/r)^5
+            acceleration = accelCoeff * position * invRadius5;
+            velocity += acceleration * (0.5 * stepSize);
+
+            // ---- 薄盘穿越：光线穿过了盘平面 ----
+            float planeDistance = dot(position, diskNormal);
+            if (planeDistance * planeDistancePrev < 0.0 && transmittance > 0.02) {
+                float crossFraction = planeDistancePrev / (planeDistancePrev - planeDistance);
+                float3 crossPoint = mix(positionPrev, position, crossFraction);
+                float crossRadius = length(crossPoint);
+                if (crossRadius > diskInner && crossRadius < diskOuter) {
+                    float band = smoothstep(diskInner, diskInner * 1.25, crossRadius)
+                        * (1.0 - smoothstep(diskOuter * 0.70, diskOuter, crossRadius));
+
+                    // 盘平面极坐标，用于条纹纹理
+                    float phi = atan2(dot(crossPoint, diskAxis), crossPoint.x);
+                    float turns = phi / (2.0 * pi);
+                    float keplerRate = pow(diskInner / crossRadius, 1.5);
+                    // √(1 − 1.5/r)：内侧轨道时间流逝更慢，图案在内边缘明显凝滞
+                    float gravitationalFactor = sqrt(max(1.0 - 1.5 / crossRadius, 0.02));
+                    float swirl = crossRadius * kDiskWind * 0.12
+                        - time * keplerRate * spinSpeed * gravitationalFactor * spinDirection;
+                    float streaks =
+                        valueNoiseWrapY(float2(crossRadius * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65 +
+                        valueNoiseWrapY(float2(crossRadius * 1.0, turns * 9.0 + swirl * 1.5 + 7.0), 9.0) * 0.35;
+                    streaks = 0.35 + kDiskContrast * streaks * streaks;
+
+                    // 圆轨道气体的相对论多普勒 + 引力红移：
+                    // g = √(1 − 1.5/r) / (1 − β·k̂)，光子方向直接取自当前光线
+                    float3 gasDirection = normalize(cross(diskNormal, crossPoint)) * spinDirection;
+                    float beta = clamp(rsqrt(max(2.0 * (crossRadius - 1.0), 0.2)), 0.0, 0.99);
+                    float shift = gravitationalFactor
+                        / max(1.0 + beta * dot(gasDirection, normalize(velocity)), 0.05);
+                    shift = mix(1.0, shift, kDopplerMix);
+
+                    // Shakura–Sunyaev 温度剖面，峰值归一化到 1
+                    float temperatureEdge = max(1.0 - sqrt(diskInner / crossRadius), 0.0);
+                    float temperatureProfile = pow(diskInner / crossRadius, 0.75)
+                        * pow(temperatureEdge, 0.25) / 0.488;
+                    float3 diskColor = blackbody(kDiskTemp * temperatureProfile * shift); // 多普勒偏色
+                    float boost = pow(shift, kDiskBeam);                                  // 相对论集束
+
+                    float density = band * streaks;
+                    emission += transmittance * diskColor
+                        * (kDiskGain * 2.2 * density * temperatureProfile * temperatureProfile * boost);
+                    transmittance *= 1.0 - clamp(kDiskOpacity * density, 0.0, 1.0);
+                }
+            }
+            planeDistancePrev = planeDistance;
+            positionPrev = position;
         }
-        planeDistancePrev = planeDistance;
-        positionPrev = position;
-    }
-    // 预算耗尽时仍缠绕在光子球附近的光线，等同于被捕获
-    if (!captured && dot(position, position) < 4.0) {
-        captured = true;
+        // 预算耗尽时仍缠绕在光子球附近的光线，等同于被捕获
+        if (!captured && dot(position, position) < 4.0) {
+            captured = true;
+        }
     }
 
     // ---- 背景：逃逸光线来自哪里？ ----

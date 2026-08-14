@@ -128,6 +128,7 @@ private enum RendererError: LocalizedError {
     case noTextureCache
     case missingShaderSource(String)
     case missingShaderFunction(String)
+    case lutAllocationFailed
 
     var errorDescription: String? {
         switch self {
@@ -139,7 +140,160 @@ private enum RendererError: LocalizedError {
             return "Unable to load the Metal shader source at \(path)"
         case .missingShaderFunction(let name):
             return "The Metal shader function \(name) is missing"
+        case .lutAllocationFailed:
+            return "Unable to allocate the geodesic lookup tables"
         }
+    }
+}
+
+// 预计算逃逸测地线查找表（近似方案 A 第一步：只替掉“逃逸几何”，不碰吸积盘）。
+//
+// 物理事实：史瓦西是中心力场，光子轨道恒在一个平面内，因此“平行入射、冲击参数为 b
+// 的光线最终逃向何方”只是 b 的一元函数。据此在启动时用 CPU 复刻着色器的积分器
+// （同样的 N_STEPS、自适应步长、蛙跳），把逃逸终点状态制成一维表：
+//
+//   * 透镜表 lens[b]  —— 光线自身 2D 平面内的终点 (px, pz) 与归一化方向 (dx, dz)。
+//     着色器按像素方位角把它旋转回 3D，再做与原来完全一致的天空平面投影。
+//   * 盘门控表 gate[方位角] —— 每个方位角上“可能穿过吸积盘”的 b 区间 [lo, hi]。
+//     盘因倾斜+滚转在屏幕上不是同心圆，足迹随方位角变化。区间之外的光线保证碰不到盘，
+//     可安全跳过 48 步积分、直接查透镜表；区间之内仍走完整积分累加盘光。
+//
+// 表与屏幕分辨率、黑洞尺寸/位置、屏幕数量全部无关（用的是史瓦西半径下的纯物理量），
+// 故只算一次、所有屏幕共享，内存约 16KB(透镜) + 1.4KB(门控)。
+//
+// ⚠️ 下列常量必须与 BlackHoleShaders.metal 中的物理常量保持一致，改一处要同步另一处：
+//   bCrit=B_CRIT, nSteps=N_STEPS, diskIncl=kDiskIncl, diskInner=max(kDiskInner,1.6),
+//   diskOuter=max(kDiskOuter,diskInner+0.5), cameraDistance=max(14,kDiskOuter+5),
+//   maxImpact=kDiskOuter+3, lensSamples=kLensSamples, gateAzimuths=kGateAzimuths。
+private enum GeodesicLUT {
+    static let bCrit: Float = 2.5980762
+    static let nSteps = 48
+    static let diskInner: Float = 1.8            // max(kDiskInner=1.8, 1.6)
+    static let diskOuter: Float = 8.0            // max(kDiskOuter=8.0, diskInner+0.5)
+    static let diskIncl: Float = 1.5
+    static let cameraDistance: Float = 14.0      // max(14, kDiskOuter+5)
+    static let maxImpact: Float = 11.0           // kDiskOuter + 3
+    static let lensSamples = 1024                // 需与着色器 kLensSamples 一致
+    static let gateAzimuths = 180                // 需与着色器 kGateAzimuths 一致
+
+    // 复刻着色器的单条光线积分，返回逃逸终点在其 2D 轨道平面内的状态。
+    // (px, pz) 为终点位置：px 是平面内横向（初始沿 +冲击参数方向）、pz 是纵深；
+    // (dx, dz) 为归一化终点方向。captured 为真表示落入视界（本表定义域内不应出现）。
+    private static func integrateLens(_ b: Float) -> (px: Float, pz: Float, dx: Float, dz: Float, captured: Bool) {
+        let accelCoeff = -1.5 * b * b
+        let farBound = 4.0 * cameraDistance * cameraDistance
+        var px = b, pz = cameraDistance
+        var vx: Float = 0, vz: Float = -1
+        var captured = false
+        for _ in 0..<nSteps {
+            var r2 = px * px + pz * pz
+            if r2 < 1.0 { captured = true; break }
+            if pz < -cameraDistance && vz < 0 { break }
+            if r2 > farBound { break }
+            let invR = 1.0 / sqrtf(r2)
+            let radius = r2 * invR
+            let step = min(max(0.16 * radius, 0.03), 1.5)
+            var invR5 = invR * invR; invR5 = invR5 * invR5 * invR
+            vx += accelCoeff * px * invR5 * (0.5 * step)
+            vz += accelCoeff * pz * invR5 * (0.5 * step)
+            px += vx * step; pz += vz * step
+            r2 = px * px + pz * pz
+            let invRb = 1.0 / sqrtf(r2)
+            var invR5b = invRb * invRb; invR5b = invR5b * invR5b * invRb
+            vx += accelCoeff * px * invR5b * (0.5 * step)
+            vz += accelCoeff * pz * invR5b * (0.5 * step)
+        }
+        if !captured && (px * px + pz * pz) < 4.0 { captured = true }
+        let invLen = 1.0 / sqrtf(vx * vx + vz * vz)
+        return (px, pz, vx * invLen, vz * invLen, captured)
+    }
+
+    // 判断给定屏幕平面坐标（已乘 worldScale、已施加滚转的 rayPoint）的光线是否穿过吸积盘环带。
+    private static func touchesDisk(_ rx: Float, _ ry: Float) -> Bool {
+        let cosI = cosf(diskIncl), sinI = sinf(diskIncl)
+        // 盘法线 (0, sinI, cosI)
+        let nx: Float = 0, ny = sinI, nz = cosI
+        var pxx = rx, pyy = ry, pzz = cameraDistance
+        var vx: Float = 0, vy: Float = 0, vz: Float = -1
+        let accelCoeff = -1.5 * (rx * rx + ry * ry)
+        let farBound = 4.0 * cameraDistance * cameraDistance
+        var planePrev = pxx * nx + pyy * ny + pzz * nz
+        var ppx = pxx, ppy = pyy, ppz = pzz
+        for _ in 0..<nSteps {
+            var r2 = pxx * pxx + pyy * pyy + pzz * pzz
+            if r2 < 1.0 { return false }
+            if pzz < -cameraDistance && vz < 0 { break }
+            if r2 > farBound { break }
+            let invR = 1.0 / sqrtf(r2)
+            let radius = r2 * invR
+            let step = min(max(0.16 * radius, 0.03), 1.5)
+            var invR5 = invR * invR; invR5 = invR5 * invR5 * invR
+            vx += accelCoeff * pxx * invR5 * (0.5 * step)
+            vy += accelCoeff * pyy * invR5 * (0.5 * step)
+            vz += accelCoeff * pzz * invR5 * (0.5 * step)
+            pxx += vx * step; pyy += vy * step; pzz += vz * step
+            r2 = pxx * pxx + pyy * pyy + pzz * pzz
+            let invRb = 1.0 / sqrtf(r2)
+            var invR5b = invRb * invRb; invR5b = invR5b * invR5b * invRb
+            vx += accelCoeff * pxx * invR5b * (0.5 * step)
+            vy += accelCoeff * pyy * invR5b * (0.5 * step)
+            vz += accelCoeff * pzz * invR5b * (0.5 * step)
+            let planeDist = pxx * nx + pyy * ny + pzz * nz
+            if planeDist * planePrev < 0 {
+                let frac = planePrev / (planePrev - planeDist)
+                let cx = ppx + (pxx - ppx) * frac
+                let cy = ppy + (pyy - ppy) * frac
+                let cz = ppz + (pzz - ppz) * frac
+                let cr = sqrtf(cx * cx + cy * cy + cz * cz)
+                if cr > diskInner && cr < diskOuter { return true }
+            }
+            planePrev = planeDist; ppx = pxx; ppy = pyy; ppz = pzz
+        }
+        return false
+    }
+
+    // 透镜表：lensSamples 个 SIMD4<Float>(px, pz, dx, dz)，b 在 [bCrit, maxImpact] 上等距采样
+    static func buildLensTable() -> [SIMD4<Float>] {
+        var table = [SIMD4<Float>](repeating: .zero, count: lensSamples)
+        for i in 0..<lensSamples {
+            let b = bCrit + (maxImpact - bCrit) * Float(i) / Float(lensSamples - 1)
+            let s = integrateLens(b)
+            table[i] = SIMD4(s.px, s.pz, s.dx, s.dz)
+        }
+        return table
+    }
+
+    // 盘门控表：gateAzimuths 个 SIMD2<Float>(loB, hiB)。无盘的方位存 (∞, 0) → 判定恒为“不碰盘”。
+    // 保守外扩：半径向外扩两个扫描格宽，并对相邻方位桶取并，抵消离散化漏判。
+    static func buildGateTable() -> [SIMD2<Float>] {
+        let bScan = 600
+        var lo = [Float](repeating: .greatestFiniteMagnitude, count: gateAzimuths)
+        var hi = [Float](repeating: 0, count: gateAzimuths)
+        for ai in 0..<gateAzimuths {
+            let az = 2 * Float.pi * (Float(ai) + 0.5) / Float(gateAzimuths)
+            let cx = cosf(az), cy = sinf(az)
+            for bi in 0..<bScan {
+                let b = bCrit + (maxImpact - bCrit) * (Float(bi) + 0.5) / Float(bScan)
+                if touchesDisk(b * cx, b * cy) {
+                    lo[ai] = min(lo[ai], b); hi[ai] = max(hi[ai], b)
+                }
+            }
+        }
+        let pad = (maxImpact - bCrit) / Float(bScan) * 2
+        var table = [SIMD2<Float>](repeating: .zero, count: gateAzimuths)
+        for ai in 0..<gateAzimuths {
+            var l = lo[ai], h = hi[ai]
+            for d in [-1, 1] {
+                let j = (ai + d + gateAzimuths) % gateAzimuths
+                if hi[j] > 0 { l = min(l, lo[j]); h = max(h, hi[j]) }
+            }
+            if h == 0 {
+                table[ai] = SIMD2(.greatestFiniteMagnitude, 0)   // 该方位无盘：恒判“不碰盘”
+            } else {
+                table[ai] = SIMD2(max(bCrit, l - pad), h + pad)
+            }
+        }
+        return table
     }
 }
 
@@ -273,6 +427,9 @@ private final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDeleg
 private final class RenderResources {
     let device: MTLDevice
     let library: MTLLibrary
+    // 预计算的逃逸测地线查找表，所有屏幕共享（见 GeodesicLUT 说明）
+    let lensTable: MTLBuffer
+    let gateTable: MTLBuffer
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -285,6 +442,23 @@ private final class RenderResources {
         }
         self.device = device
         self.library = try device.makeLibrary(source: shaderSource, options: nil)
+
+        // 启动时构建一次逃逸测地线查找表（CPU 数值积分），上传为共享只读缓冲。
+        let lens = GeodesicLUT.buildLensTable()
+        let gate = GeodesicLUT.buildGateTable()
+        guard let lensBuffer = device.makeBuffer(
+                bytes: lens,
+                length: MemoryLayout<SIMD4<Float>>.stride * lens.count,
+                options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                bytes: gate,
+                length: MemoryLayout<SIMD2<Float>>.stride * gate.count,
+                options: .storageModeShared)
+        else {
+            throw RendererError.lutAllocationFailed
+        }
+        self.lensTable = lensBuffer
+        self.gateTable = gateBuffer
     }
 }
 
@@ -293,6 +467,9 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let pipelineState: MTLRenderPipelineState
     private let captureSource: ScreenCaptureSource
     private let textureCache: CVMetalTextureCache
+    // 共享的逃逸测地线查找表（由 RenderResources 构建，所有屏幕复用同一份缓冲）
+    private let lensTable: MTLBuffer
+    private let gateTable: MTLBuffer
     private let startTime = CACurrentMediaTime()
     private let shadowRadius: Float
     private let driftSpeed: Float
@@ -361,6 +538,8 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         self.commandQueue = commandQueue
         self.captureSource = captureSource
         self.textureCache = textureCache
+        self.lensTable = resources.lensTable
+        self.gateTable = resources.gateTable
         pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
         super.init()
     }
@@ -438,6 +617,9 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<RenderUniforms>.stride, index: 0)
+        // 预计算的逃逸测地线查找表（所有屏幕共享的只读缓冲）
+        encoder.setFragmentBuffer(lensTable, offset: 0, index: 1)
+        encoder.setFragmentBuffer(gateTable, offset: 0, index: 2)
         encoder.setFragmentTexture(screenTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
