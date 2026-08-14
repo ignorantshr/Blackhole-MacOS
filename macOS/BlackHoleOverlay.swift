@@ -175,6 +175,16 @@ private enum GeodesicLUT {
     static let maxImpact: Float = 11.0           // kDiskOuter + 3
     static let lensSamples = 1024                // 需与着色器 kLensSamples 一致
     static let gateAzimuths = 180                // 需与着色器 kGateAzimuths 一致
+    // 吸积盘二维查表（方案A第二步）：把“可能穿盘”的单次穿越像素也改成查表，
+    // 免去逐像素积分。表按 (b, θ) 索引，θ 为光线在自身 2D 轨道平面内的累积极角。
+    static let diskBSamples = 256                // 需与着色器 kDiskBSamples 一致
+    static let diskThetaSamples = 256            // 需与着色器 kDiskThetaSamples 一致
+    // 混合门限：b < gateBFactor·bCrit 的光子环环带仍走完整积分（含全部多次穿越）；
+    // b ≥ 该门限的单次穿盘像素才用盘表重建。验证表明多次穿越像素全部落在门限以内。
+    static let gateBFactor: Float = 1.5
+    static let diskThetaMax: Float = 1.5 * Float.pi   // θ 采样上限，覆盖近侧+远侧穿越
+    // θ 采样下界：入射极角 atan2(bCrit, cameraDistance)（随 b 略变，取 bCrit 处为基准）
+    static var diskTheta0: Float { atan2f(bCrit, cameraDistance) }
 
     // 复刻着色器的单条光线积分，返回逃逸终点在其 2D 轨道平面内的状态。
     // (px, pz) 为终点位置：px 是平面内横向（初始沿 +冲击参数方向）、pz 是纵深；
@@ -291,6 +301,85 @@ private enum GeodesicLUT {
                 table[ai] = SIMD2(.greatestFiniteMagnitude, 0)   // 该方位无盘：恒判“不碰盘”
             } else {
                 table[ai] = SIMD2(max(bCrit, l - pad), h + pad)
+            }
+        }
+        return table
+    }
+
+    // 单条光线在其 2D 轨道平面内的积分：坐标 (s, z)，s 沿像素径向、z 为纵深。
+    // 返回沿轨迹的 (累积极角 θ, 半径 r, 归一化速度 vs, vz) 序列，θ 已 unwrap 单调递增。
+    // 与 integrateLens 是同一物理，只是额外记录中间状态供盘表按 θ 采样。
+    private static func planarTrajectory(_ b: Float)
+        -> (theta: [Float], r: [Float], vs: [Float], vz: [Float]) {
+        let accelCoeff = -1.5 * b * b
+        let farBound = 4.0 * cameraDistance * cameraDistance
+        var s = b, z = cameraDistance
+        var vs: Float = 0, vz: Float = -1
+        var thetas: [Float] = [], radii: [Float] = [], velS: [Float] = [], velZ: [Float] = []
+        var prevTheta = atan2f(s, z)
+        var unwrapped = prevTheta
+        func pushVelocity() {
+            let invLen = 1.0 / sqrtf(vs * vs + vz * vz)
+            velS.append(vs * invLen); velZ.append(vz * invLen)
+        }
+        thetas.append(unwrapped); radii.append(sqrtf(s * s + z * z)); pushVelocity()
+        for _ in 0..<nSteps {
+            var r2 = s * s + z * z
+            if r2 < 1.0 { break }
+            if z < -cameraDistance && vz < 0 { break }
+            if r2 > farBound { break }
+            let invR = 1.0 / sqrtf(r2)
+            let radius = r2 * invR
+            let step = min(max(0.16 * radius, 0.03), 1.5)
+            var invR5 = invR * invR; invR5 = invR5 * invR5 * invR
+            vs += accelCoeff * s * invR5 * (0.5 * step)
+            vz += accelCoeff * z * invR5 * (0.5 * step)
+            s += vs * step; z += vz * step
+            r2 = s * s + z * z
+            let invRb = 1.0 / sqrtf(r2)
+            var invR5b = invRb * invRb; invR5b = invR5b * invR5b * invRb
+            vs += accelCoeff * s * invR5b * (0.5 * step)
+            vz += accelCoeff * z * invR5b * (0.5 * step)
+            // θ unwrap：把每步增量归一到 (−π, π] 再累加，得到单调极角
+            let theta = atan2f(s, z)
+            var delta = theta - prevTheta
+            if delta < -Float.pi { delta += 2 * Float.pi }
+            if delta > Float.pi { delta -= 2 * Float.pi }
+            unwrapped += delta; prevTheta = theta
+            thetas.append(unwrapped); radii.append(sqrtf(r2)); pushVelocity()
+        }
+        return (thetas, radii, velS, velZ)
+    }
+
+    // 在单调序列 xs 上对 q 做线性插值取 ys；q 超出范围返回 nil。
+    private static func interpolate(_ xs: [Float], _ ys: [Float], _ q: Float) -> Float? {
+        if xs.count < 2 || q < xs[0] || q > xs[xs.count - 1] { return nil }
+        var lo = 0, hi = xs.count - 1
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if xs[mid] <= q { lo = mid } else { hi = mid }
+        }
+        let t = (q - xs[lo]) / (xs[hi] - xs[lo])
+        return ys[lo] * (1 - t) + ys[hi] * t
+    }
+
+    // 吸积盘二维表：diskBSamples × diskThetaSamples 个 SIMD4<Float>(r, vs, vz, 0)。
+    // 行索引对应 b∈[bCrit, maxImpact]，列索引对应 θ∈[diskTheta0, diskThetaMax]。
+    // θ 超出该 b 实际 unwrap 范围处存 0（着色器据此判定“该 (b,θ) 无穿越”）。
+    static func buildDiskTable() -> [SIMD4<Float>] {
+        let theta0 = diskTheta0
+        var table = [SIMD4<Float>](repeating: .zero, count: diskBSamples * diskThetaSamples)
+        for bi in 0..<diskBSamples {
+            let b = bCrit + (maxImpact - bCrit) * Float(bi) / Float(diskBSamples - 1)
+            let traj = planarTrajectory(b)
+            for tj in 0..<diskThetaSamples {
+                let theta = theta0 + (diskThetaMax - theta0) * Float(tj) / Float(diskThetaSamples - 1)
+                guard let r = interpolate(traj.theta, traj.r, theta),
+                      let vs = interpolate(traj.theta, traj.vs, theta),
+                      let vz = interpolate(traj.theta, traj.vz, theta) else {
+                    continue   // 保持 .zero，表示该 (b,θ) 无有效穿越
+                }
+                table[bi * diskThetaSamples + tj] = SIMD4(r, vs, vz, 0)
             }
         }
         return table
@@ -430,6 +519,8 @@ private final class RenderResources {
     // 预计算的逃逸测地线查找表，所有屏幕共享（见 GeodesicLUT 说明）
     let lensTable: MTLBuffer
     let gateTable: MTLBuffer
+    // 吸积盘二维查表 (r, vs, vz)，所有屏幕共享（方案A第二步）
+    let diskTable: MTLBuffer
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -446,6 +537,7 @@ private final class RenderResources {
         // 启动时构建一次逃逸测地线查找表（CPU 数值积分），上传为共享只读缓冲。
         let lens = GeodesicLUT.buildLensTable()
         let gate = GeodesicLUT.buildGateTable()
+        let disk = GeodesicLUT.buildDiskTable()
         guard let lensBuffer = device.makeBuffer(
                 bytes: lens,
                 length: MemoryLayout<SIMD4<Float>>.stride * lens.count,
@@ -453,12 +545,17 @@ private final class RenderResources {
               let gateBuffer = device.makeBuffer(
                 bytes: gate,
                 length: MemoryLayout<SIMD2<Float>>.stride * gate.count,
+                options: .storageModeShared),
+              let diskBuffer = device.makeBuffer(
+                bytes: disk,
+                length: MemoryLayout<SIMD4<Float>>.stride * disk.count,
                 options: .storageModeShared)
         else {
             throw RendererError.lutAllocationFailed
         }
         self.lensTable = lensBuffer
         self.gateTable = gateBuffer
+        self.diskTable = diskBuffer
     }
 }
 
@@ -470,6 +567,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     // 共享的逃逸测地线查找表（由 RenderResources 构建，所有屏幕复用同一份缓冲）
     private let lensTable: MTLBuffer
     private let gateTable: MTLBuffer
+    private let diskTable: MTLBuffer
     private let startTime = CACurrentMediaTime()
     private let shadowRadius: Float
     private let driftSpeed: Float
@@ -540,6 +638,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         self.textureCache = textureCache
         self.lensTable = resources.lensTable
         self.gateTable = resources.gateTable
+        self.diskTable = resources.diskTable
         pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
         super.init()
     }
@@ -620,6 +719,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         // 预计算的逃逸测地线查找表（所有屏幕共享的只读缓冲）
         encoder.setFragmentBuffer(lensTable, offset: 0, index: 1)
         encoder.setFragmentBuffer(gateTable, offset: 0, index: 2)
+        encoder.setFragmentBuffer(diskTable, offset: 0, index: 3)
         encoder.setFragmentTexture(screenTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()

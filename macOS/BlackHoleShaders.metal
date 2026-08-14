@@ -66,6 +66,20 @@ constant float kFieldOuter  = 2.05;   // 覆盖归零处，向外即完全透明
 #define kLensSamples 1024
 #define kGateAzimuths 180
 
+// 吸积盘二维查表维度（方案A第二步），必须与 BlackHoleOverlay.swift 的
+// GeodesicLUT.diskBSamples / diskThetaSamples 一致。表按 (b, θ) 索引，
+// θ 为光线在自身 2D 轨道平面内的累积极角。
+#define kDiskBSamples 256
+#define kDiskThetaSamples 256
+// 混合门限：b < kGateBFactor·B_CRIT 的光子环环带仍走完整积分（含全部多次穿越），
+// b ≥ 该门限的单次穿盘像素才用盘表重建。必须与 Swift 的 gateBFactor 一致。
+#define kGateBFactor 1.5
+// 盘表 θ 采样上限，覆盖近侧+远侧穿越。必须与 Swift 的 diskThetaMax 一致。
+#define kDiskThetaMax (1.5 * 3.14159265359)
+// 盘表 θ 采样下界：入射极角 atan2(B_CRIT, cameraDistance)，cameraDistance=14。
+// 必须与 Swift 的 diskTheta0 = atan2f(bCrit, cameraDistance) 一致。
+#define kDiskTheta0 atan2((float)B_CRIT, 14.0)
+
 constant float pi = 3.14159265359;
 
 struct RenderUniforms {
@@ -201,11 +215,91 @@ bool rayMissesDisk(constant float2 *gateTable, float azimuth, float impactParame
     return impactParameter < span.x || impactParameter > span.y;
 }
 
+// 单个盘穿越点的着色：给定穿越点、该处光线速度、盘正交系与转动参数，
+// 返回本次穿越对累积发光的贡献增量（已乘 transmittance）与不透明度。
+// 积分路径与查表路径共用同一段物理，保证两条路径盘光一致。
+struct DiskShade { float3 emissionAdd; float opacity; };
+
+DiskShade shadeDiskCrossing(
+    float3 crossPoint, float3 velocity, float3 diskNormal, float3 diskAxis,
+    float spinDirection, float spinSpeed, float diskInner, float diskOuter,
+    float time, float transmittance
+) {
+    DiskShade result;
+    result.emissionAdd = float3(0.0);
+    result.opacity = 0.0;
+    float crossRadius = length(crossPoint);
+    if (!(crossRadius > diskInner && crossRadius < diskOuter)) {
+        return result;
+    }
+    float band = smoothstep(diskInner, diskInner * 1.25, crossRadius)
+        * (1.0 - smoothstep(diskOuter * 0.70, diskOuter, crossRadius));
+
+    // 盘平面极坐标，用于条纹纹理
+    float phi = atan2(dot(crossPoint, diskAxis), crossPoint.x);
+    float turns = phi / (2.0 * pi);
+    float keplerRate = pow(diskInner / crossRadius, 1.5);
+    // √(1 − 1.5/r)：内侧轨道时间流逝更慢，图案在内边缘明显凝滞
+    float gravitationalFactor = sqrt(max(1.0 - 1.5 / crossRadius, 0.02));
+    float swirl = crossRadius * kDiskWind * 0.12
+        - time * keplerRate * spinSpeed * gravitationalFactor * spinDirection;
+    float streaks =
+        valueNoiseWrapY(float2(crossRadius * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65 +
+        valueNoiseWrapY(float2(crossRadius * 1.0, turns * 9.0 + swirl * 1.5 + 7.0), 9.0) * 0.35;
+    streaks = 0.35 + kDiskContrast * streaks * streaks;
+
+    // 圆轨道气体的相对论多普勒 + 引力红移：
+    // g = √(1 − 1.5/r) / (1 − β·k̂)，光子方向直接取自当前光线
+    float3 gasDirection = normalize(cross(diskNormal, crossPoint)) * spinDirection;
+    float beta = clamp(rsqrt(max(2.0 * (crossRadius - 1.0), 0.2)), 0.0, 0.99);
+    float shift = gravitationalFactor
+        / max(1.0 + beta * dot(gasDirection, normalize(velocity)), 0.05);
+    shift = mix(1.0, shift, kDopplerMix);
+
+    // Shakura–Sunyaev 温度剖面，峰值归一化到 1
+    float temperatureEdge = max(1.0 - sqrt(diskInner / crossRadius), 0.0);
+    float temperatureProfile = pow(diskInner / crossRadius, 0.75)
+        * pow(temperatureEdge, 0.25) / 0.488;
+    float3 diskColor = blackbody(kDiskTemp * temperatureProfile * shift); // 多普勒偏色
+    float boost = pow(shift, kDiskBeam);                                  // 相对论集束
+
+    float density = band * streaks;
+    result.emissionAdd = transmittance * diskColor
+        * (kDiskGain * 2.2 * density * temperatureProfile * temperatureProfile * boost);
+    result.opacity = clamp(kDiskOpacity * density, 0.0, 1.0);
+    return result;
+}
+
+// 吸积盘二维表查询：在 (b, θ) 上双线性插值取回 (r, vs, vz)。
+// θ 超出该 b 实际轨迹范围时表存 0，任一角点为 0 视为无效穿越，返回 false。
+struct DiskSample { float radius; float vs; float vz; };
+
+bool sampleDiskTable(constant float4 *diskTable, float impactParameter, float theta,
+                     thread DiskSample &out) {
+    float fb = (impactParameter - B_CRIT) / (11.0 - B_CRIT) * float(kDiskBSamples - 1);
+    fb = clamp(fb, 0.0, float(kDiskBSamples - 1));
+    float ft = (theta - kDiskTheta0) / (kDiskThetaMax - kDiskTheta0) * float(kDiskThetaSamples - 1);
+    if (ft < 0.0 || ft > float(kDiskThetaSamples - 1)) { return false; }
+    int b0 = int(floor(fb)), t0 = int(floor(ft));
+    int b1 = min(b0 + 1, kDiskBSamples - 1), t1 = min(t0 + 1, kDiskThetaSamples - 1);
+    float bf = fb - float(b0), tf = ft - float(t0);
+    float4 v00 = diskTable[b0 * kDiskThetaSamples + t0];
+    float4 v01 = diskTable[b0 * kDiskThetaSamples + t1];
+    float4 v10 = diskTable[b1 * kDiskThetaSamples + t0];
+    float4 v11 = diskTable[b1 * kDiskThetaSamples + t1];
+    // 任一角点半径为 0 → θ 超出该 b 的轨迹范围，插值会被污染，判为无效
+    if (v00.x == 0.0 || v01.x == 0.0 || v10.x == 0.0 || v11.x == 0.0) { return false; }
+    float4 s = mix(mix(v00, v01, tf), mix(v10, v11, tf), bf);
+    out.radius = s.x; out.vs = s.y; out.vz = s.z;
+    return true;
+}
+
 fragment float4 blackHoleFragment(
     VertexOutput input [[stage_in]],
     constant RenderUniforms &uniforms [[buffer(0)]],
     constant float4 *lensTable [[buffer(1)]],   // 逃逸测地线终点：(px, pz, dx, dz)，b 等距采样
     constant float2 *gateTable [[buffer(2)]],   // 盘门控：每方位 (loB, hiB) 冲击参数区间
+    constant float4 *diskTable [[buffer(3)]],   // 吸积盘二维表：(b, θ) → (r, vs, vz, 0)
     texture2d<float> screenTexture [[texture(0)]]
 ) {
     constexpr sampler screenSampler(coord::normalized, address::clamp_to_edge, filter::linear);
@@ -334,20 +428,79 @@ fragment float4 blackHoleFragment(
     float transmittance = 1.0;       // 朝向背景的透过率
     bool captured = false;
 
-    // 查表快路径判据：冲击参数在查找表定义域内（b ≥ B_CRIT，即阴影核心之外，
-    // 恒逃逸不被捕获），且盘门控保证这条光线碰不到吸积盘。两者同时成立时，
-    // 逃逸终点是 b 的一元函数，可直接查透镜表，省掉整段 48 步积分与盘穿越判定。
-    // 阴影核心（b < B_CRIT）以及可能穿盘的光线仍走下方完整积分。
+    // 查表快路径判据。两条查表路径都要求 b ≥ B_CRIT（阴影核心之外，恒逃逸不被捕获），
+    // 逃逸终点是 b 的一元函数，可直接查透镜表重建，省掉整段 48 步积分：
+    //   useLensTable —— 盘门控保证这条光线碰不到吸积盘，只查透镜表、盘光恒为 0；
+    //   useDiskTable —— 光线可能穿盘，但 b ≥ kGateBFactor·B_CRIT（光子环环带以外，
+    //                    验证表明该区恒为单次穿越），透镜表重建几何后再用盘二维表
+    //                    重建近侧/远侧穿越点并着色。
+    // 阴影核心（b < B_CRIT）与光子环环带（b < kGateBFactor·B_CRIT，含全部多次穿越）
+    // 仍走下方完整积分，保证光子环物理与多次穿越准确。
     float rayAzimuth = atan2(rayPoint.y, rayPoint.x);
-    bool useLensTable = impactParameter >= B_CRIT
-        && rayMissesDisk(gateTable, rayAzimuth, impactParameter);
+    bool aboveCore = impactParameter >= B_CRIT;
+    bool missesDisk = rayMissesDisk(gateTable, rayAzimuth, impactParameter);
+    bool useLensTable = aboveCore && missesDisk;
+    bool useDiskTable = aboveCore && !missesDisk
+        && impactParameter >= kGateBFactor * B_CRIT;
 
-    if (useLensTable) {
+    if (useLensTable || useDiskTable) {
         // 查表并把平面内终点状态沿像素方位旋转回 3D（中心力场 → 平面运动）
         LensSample ls = sampleLensTable(lensTable, impactParameter);
         float2 radial = rayPoint / max(impactParameter, 1e-5);
         position = float3(radial * ls.px, ls.pz);
         velocity = float3(radial * ls.dx, ls.dz);   // 已归一化
+
+        if (useDiskTable) {
+            // 盘二维表重建：解析求穿盘极角 θ*，用盘表在 (b, θ) 取回穿越半径与速度。
+            // 盘正交系与积分路径一致。P·n=0 在光线平面内的解：
+            //   tan(θ*) = -cosI / ((ry/b)·sinI)，近侧/远侧相差 π。
+            float cosIncl = cos(kDiskIncl);
+            float sinIncl = sin(kDiskIncl);
+            float3 diskNormal = float3(0.0, sinIncl, cosIncl);
+            float3 diskAxis = float3(0.0, cosIncl, -sinIncl);
+            float spinDirection = kDiskSpeed < 0.0 ? -1.0 : 1.0;
+            float spinSpeed = abs(kDiskSpeed);
+            float denom = radial.y * sinIncl;
+            float baseTheta = (abs(denom) < 1e-4) ? (0.5 * pi) : atan2(-cosIncl, denom);
+            // 候选穿越 θ：baseTheta 及 +π/+2π，各自归一到 ≥ kDiskTheta0 的可查范围。
+            // 归一后可能出现重合（baseTheta 与 baseTheta+π 落到同一 θ），需去重，
+            // 否则同一穿越会被累加两次。按 θ 升序处理保证透过率累加次序正确。
+            float thetas[3];
+            int nTheta = 0;
+            for (int k = 0; k < 3; k++) {
+                float th = baseTheta + float(k) * pi;
+                while (th < kDiskTheta0) { th += pi; }
+                bool dup = false;
+                for (int j = 0; j < nTheta; j++) {
+                    if (abs(th - thetas[j]) < 1e-3) { dup = true; break; }
+                }
+                if (!dup) { thetas[nTheta++] = th; }
+            }
+            // 升序排序（最多 3 个，插入排序）
+            for (int a = 1; a < nTheta; a++) {
+                float key = thetas[a];
+                int b = a - 1;
+                while (b >= 0 && thetas[b] > key) { thetas[b + 1] = thetas[b]; b--; }
+                thetas[b + 1] = key;
+            }
+            for (int t = 0; t < nTheta; t++) {
+                if (transmittance <= 0.02) { break; }
+                float th = thetas[t];
+                DiskSample ds;
+                if (!sampleDiskTable(diskTable, impactParameter, th, ds)) { continue; }
+                if (!(ds.radius > diskInner && ds.radius < diskOuter)) { continue; }
+                // 穿越点与该处速度：平面内 (s, z) 沿像素径向旋转回 3D
+                float s = ds.radius * sin(th);
+                float zz = ds.radius * cos(th);
+                float3 crossPoint = float3(radial * s, zz);
+                float3 crossVelocity = float3(radial * ds.vs, ds.vz);
+                DiskShade shade = shadeDiskCrossing(
+                    crossPoint, crossVelocity, diskNormal, diskAxis,
+                    spinDirection, spinSpeed, diskInner, diskOuter, time, transmittance);
+                emission += shade.emissionAdd;
+                transmittance *= 1.0 - shade.opacity;
+            }
+        }
     } else {
         // 加速度 a = -(3/2) h^2 x / r^5 里的常量系数，整条光线不变，提到循环外
         float accelCoeff = -1.5 * dot(rayPoint, rayPoint);
@@ -397,48 +550,16 @@ fragment float4 blackHoleFragment(
             velocity += acceleration * (0.5 * stepSize);
 
             // ---- 薄盘穿越：光线穿过了盘平面 ----
+            // 穿越处调用与查表路径共用的 shadeDiskCrossing，保证两条路径盘光完全一致。
             float planeDistance = dot(position, diskNormal);
             if (planeDistance * planeDistancePrev < 0.0 && transmittance > 0.02) {
                 float crossFraction = planeDistancePrev / (planeDistancePrev - planeDistance);
                 float3 crossPoint = mix(positionPrev, position, crossFraction);
-                float crossRadius = length(crossPoint);
-                if (crossRadius > diskInner && crossRadius < diskOuter) {
-                    float band = smoothstep(diskInner, diskInner * 1.25, crossRadius)
-                        * (1.0 - smoothstep(diskOuter * 0.70, diskOuter, crossRadius));
-
-                    // 盘平面极坐标，用于条纹纹理
-                    float phi = atan2(dot(crossPoint, diskAxis), crossPoint.x);
-                    float turns = phi / (2.0 * pi);
-                    float keplerRate = pow(diskInner / crossRadius, 1.5);
-                    // √(1 − 1.5/r)：内侧轨道时间流逝更慢，图案在内边缘明显凝滞
-                    float gravitationalFactor = sqrt(max(1.0 - 1.5 / crossRadius, 0.02));
-                    float swirl = crossRadius * kDiskWind * 0.12
-                        - time * keplerRate * spinSpeed * gravitationalFactor * spinDirection;
-                    float streaks =
-                        valueNoiseWrapY(float2(crossRadius * 2.8, turns * 19.0 + swirl * 3.0), 19.0) * 0.65 +
-                        valueNoiseWrapY(float2(crossRadius * 1.0, turns * 9.0 + swirl * 1.5 + 7.0), 9.0) * 0.35;
-                    streaks = 0.35 + kDiskContrast * streaks * streaks;
-
-                    // 圆轨道气体的相对论多普勒 + 引力红移：
-                    // g = √(1 − 1.5/r) / (1 − β·k̂)，光子方向直接取自当前光线
-                    float3 gasDirection = normalize(cross(diskNormal, crossPoint)) * spinDirection;
-                    float beta = clamp(rsqrt(max(2.0 * (crossRadius - 1.0), 0.2)), 0.0, 0.99);
-                    float shift = gravitationalFactor
-                        / max(1.0 + beta * dot(gasDirection, normalize(velocity)), 0.05);
-                    shift = mix(1.0, shift, kDopplerMix);
-
-                    // Shakura–Sunyaev 温度剖面，峰值归一化到 1
-                    float temperatureEdge = max(1.0 - sqrt(diskInner / crossRadius), 0.0);
-                    float temperatureProfile = pow(diskInner / crossRadius, 0.75)
-                        * pow(temperatureEdge, 0.25) / 0.488;
-                    float3 diskColor = blackbody(kDiskTemp * temperatureProfile * shift); // 多普勒偏色
-                    float boost = pow(shift, kDiskBeam);                                  // 相对论集束
-
-                    float density = band * streaks;
-                    emission += transmittance * diskColor
-                        * (kDiskGain * 2.2 * density * temperatureProfile * temperatureProfile * boost);
-                    transmittance *= 1.0 - clamp(kDiskOpacity * density, 0.0, 1.0);
-                }
+                DiskShade shade = shadeDiskCrossing(
+                    crossPoint, velocity, diskNormal, diskAxis,
+                    spinDirection, spinSpeed, diskInner, diskOuter, time, transmittance);
+                emission += shade.emissionAdd;
+                transmittance *= 1.0 - shade.opacity;
             }
             planeDistancePrev = planeDistance;
             positionPrev = position;
