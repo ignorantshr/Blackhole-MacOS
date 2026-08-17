@@ -8,6 +8,11 @@ import ScreenCaptureKit
 
 private let quitHotKeySignature: OSType = 0x42484F4C
 private let quitHotKeyID: UInt32 = 1
+private let prefsHotKeyID: UInt32 = 2
+
+// 打开首选项面板的回调，由 AppDelegate 注入。热键回调是 C 函数、无法直接持有
+// Swift 对象，故用全局闭包搭桥，并确保在主线程执行。
+@MainActor private var openPreferencesAction: (() -> Void)?
 
 private func handleGlobalHotKey(_ nextHandler: EventHandlerCallRef?, _ event: EventRef?, _ userData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let event else { return OSStatus(eventNotHandledErr) }
@@ -21,11 +26,19 @@ private func handleGlobalHotKey(_ nextHandler: EventHandlerCallRef?, _ event: Ev
         nil,
         &identifier
     )
-    guard status == noErr, identifier.signature == quitHotKeySignature, identifier.id == quitHotKeyID else {
+    guard status == noErr, identifier.signature == quitHotKeySignature else {
         return OSStatus(eventNotHandledErr)
     }
-    NSApp.terminate(nil)
-    return noErr
+    switch identifier.id {
+    case quitHotKeyID:
+        NSApp.terminate(nil)
+        return noErr
+    case prefsHotKeyID:
+        DispatchQueue.main.async { MainActor.assumeIsolated { openPreferencesAction?() } }
+        return noErr
+    default:
+        return OSStatus(eventNotHandledErr)
+    }
 }
 
 private struct RenderUniforms {
@@ -37,28 +50,19 @@ private struct RenderUniforms {
     var driftSpeed: Float
 }
 
-// 把用户友好的 0-10 刻度线性映射到物理值：scale 5 对应默认观感。
-// 缺省或非法输入时返回 scale 5 对应的默认值。
-private func scaledOption(
-    from arguments: [String],
-    key: String,
-    lo: Float,
-    hi: Float
-) -> Float {
-    func mapScale(_ scale: Float) -> Float {
-        let clamped = min(max(scale, 0), 10)
-        return lo + (hi - lo) * (clamped / 10)
-    }
+// 从命令行读取某个 0-10 刻度参数：存在且可解析时返回截断到 [0,10] 的刻度值，
+// 缺省或非法时返回 nil（表示“未指定”，由存储值或默认值接管）。
+private func argScale(_ arguments: [String], _ key: String) -> Float? {
     for (index, argument) in arguments.enumerated()
     where argument == key && index + 1 < arguments.count {
         if let scale = Float(arguments[index + 1]) {
-            return mapScale(scale)
+            return min(max(scale, 0), 10)
         }
     }
-    return mapScale(5)
+    return nil
 }
 
-// 黑洞尺寸：--size [0-10]，映射到阴影半径占屏幕高度的比例。
+// 黑洞尺寸：0-10 刻度映射到阴影半径占屏幕高度的比例。
 // 采用分段线性，锚定三点：0→minValue、5→midValue、10→maxValue，
 // 让刻度 5 稳定保持默认观感，同时把上半段拉到更大的上限。
 // 数值越大，透镜场半径越大，GPU 采样开销越高。
@@ -67,17 +71,10 @@ private enum BlackHoleSize {
     static let midValue: Float = 0.055   // 刻度 5，历史默认观感
     static let maxValue: Float = 0.16    // 刻度 10，约屏高的一半
 
-    static func parse(from arguments: [String]) -> Float {
-        for (index, argument) in arguments.enumerated()
-        where argument == "--size" && index + 1 < arguments.count {
-            if let scale = Float(arguments[index + 1]) {
-                return mapScale(scale)
-            }
-        }
-        return mapScale(5)
-    }
+    // 命令行刻度，缺省返回 nil
+    static func scale(from arguments: [String]) -> Float? { argScale(arguments, "--size") }
 
-    private static func mapScale(_ scale: Float) -> Float {
+    static func radius(forScale scale: Float) -> Float {
         let clamped = min(max(scale, 0), 10)
         if clamped <= 5 {
             return minValue + (midValue - minValue) * (clamped / 5)
@@ -86,17 +83,19 @@ private enum BlackHoleSize {
     }
 }
 
-// 漂移速度：--speed [0-10]，映射到速度倍率 0-2.0（5→1.0），仅影响漫游，不影响吸积盘转速。
+// 漂移速度：0-10 刻度映射到速度倍率 0-2.0（5→1.0），仅影响漫游，不影响吸积盘转速。
 private enum DriftSpeed {
-    static func parse(from arguments: [String]) -> Float {
-        scaledOption(from: arguments, key: "--speed", lo: 0.0, hi: 2.0)
+    static func scale(from arguments: [String]) -> Float? { argScale(arguments, "--speed") }
+
+    static func multiplier(forScale scale: Float) -> Float {
+        min(max(scale, 0), 10) / 10 * 2.0
     }
 }
 
 // 渲染的屏幕数量：--screens N，限制在前 N 块显示器上渲染黑洞。
-// 至少 1 块，缺省或非法时返回 nil，表示所有屏幕。
+// 至少 1 块；命令行缺省或非法时返回 nil（表示“未指定”）。
 private enum ScreenCount {
-    static func parse(from arguments: [String]) -> Int? {
+    static func value(from arguments: [String]) -> Int? {
         for (index, argument) in arguments.enumerated()
         where argument == "--screens" && index + 1 < arguments.count {
             if let value = Int(arguments[index + 1]) {
@@ -107,19 +106,69 @@ private enum ScreenCount {
     }
 }
 
-// 吸附增大速率：--growth [0-10]，控制黑洞随时间“吞噬”桌面而膨胀的快慢。
-// 默认 0（关闭，尺寸恒定）；数值越大，半径逼近上限越快。
+// 吸附增大速率：0-10 刻度控制黑洞随时间“吞噬”桌面而膨胀的快慢。
+// 0 关闭（尺寸恒定）；数值越大，半径逼近上限越快。
 private enum GrowthRate {
-    static func parse(from arguments: [String]) -> Float {
-        for (index, argument) in arguments.enumerated()
-        where argument == "--growth" && index + 1 < arguments.count {
-            if let value = Float(arguments[index + 1]) {
-                // 映射到指数增长速率（1/秒）。时间常数 τ = 1/rate：
-                // 10→rate 0.05（τ≈20 秒），逼近上限约需 1 分钟；0→关闭。
-                return min(max(value, 0), 10) / 10 * 0.05
-            }
+    static func scale(from arguments: [String]) -> Float? { argScale(arguments, "--growth") }
+
+    static func rate(forScale scale: Float) -> Float {
+        // 映射到指数增长速率（1/秒）。时间常数 τ = 1/rate：
+        // 10→rate 0.05（τ≈20 秒），逼近上限约需 1 分钟；0→关闭。
+        min(max(scale, 0), 10) / 10 * 0.05
+    }
+}
+
+// 运行时可调的共享设置：尺寸/速度/增大以 0-10 刻度存储，屏幕数量单独存。
+// 所有渲染器共享同一实例并逐帧读取，故首选项面板拖动滑块即时生效；
+// 全部持久化到 UserDefaults，下次启动自动恢复。命令行参数存在时覆盖并持久化。
+// 仅在主线程访问（渲染器 draw 与首选项面板都在主线程），UserDefaults 本身线程安全。
+private final class Settings: @unchecked Sendable {
+    private enum Keys {
+        static let size = "sizeScale"
+        static let speed = "speedScale"
+        static let growth = "growthScale"
+        static let screens = "screenLimit"   // 0 表示所有屏幕
+    }
+
+    private let store = UserDefaults.standard
+    // 屏幕数量变化需要重建窗口，由 AppDelegate 注入
+    var onScreenLimitChanged: (() -> Void)?
+
+    var sizeScale: Float { didSet { store.set(sizeScale, forKey: Keys.size) } }
+    var speedScale: Float { didSet { store.set(speedScale, forKey: Keys.speed) } }
+    var growthScale: Float { didSet { store.set(growthScale, forKey: Keys.growth) } }
+    // nil 表示所有屏幕
+    var screenLimit: Int? {
+        didSet {
+            store.set(screenLimit ?? 0, forKey: Keys.screens)
+            onScreenLimitChanged?()
         }
-        return 0
+    }
+
+    // 供渲染器逐帧读取的物理值
+    var radius: Float { BlackHoleSize.radius(forScale: sizeScale) }
+    var driftSpeed: Float { DriftSpeed.multiplier(forScale: speedScale) }
+    var growthRate: Float { GrowthRate.rate(forScale: growthScale) }
+
+    init(arguments: [String]) {
+        // 存储值优先，缺省回退到默认刻度（尺寸/速度 5，增大 0）
+        sizeScale = store.object(forKey: Keys.size) != nil ? store.float(forKey: Keys.size) : 5
+        speedScale = store.object(forKey: Keys.speed) != nil ? store.float(forKey: Keys.speed) : 5
+        growthScale = store.object(forKey: Keys.growth) != nil ? store.float(forKey: Keys.growth) : 0
+        let storedScreens = store.integer(forKey: Keys.screens)   // 缺省 0
+        screenLimit = storedScreens <= 0 ? nil : storedScreens
+
+        // 命令行参数存在时覆盖
+        if let s = BlackHoleSize.scale(from: arguments) { sizeScale = s }
+        if let s = DriftSpeed.scale(from: arguments) { speedScale = s }
+        if let s = GrowthRate.scale(from: arguments) { growthScale = s }
+        if let n = ScreenCount.value(from: arguments) { screenLimit = n }
+
+        // init 内赋值不触发 didSet，这里统一持久化一次（含命令行覆盖）
+        store.set(sizeScale, forKey: Keys.size)
+        store.set(speedScale, forKey: Keys.speed)
+        store.set(growthScale, forKey: Keys.growth)
+        store.set(screenLimit ?? 0, forKey: Keys.screens)
     }
 }
 
@@ -597,11 +646,11 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let gateTable: MTLBuffer
     private let diskTable: MTLBuffer
     private let startTime = CACurrentMediaTime()
-    private let shadowRadius: Float
-    private let driftSpeed: Float
-    // 吸附增大：growthRate 为 [0,1] 速率（0 关闭）；黑洞半径随时间从初始值
-    // 渐近逼近上限，模拟持续吞噬桌面而膨胀。上限同时兜住 GPU 采样开销。
-    private let growthRate: Float
+    // 运行时可调参数的共享来源：尺寸/速度/增大均逐帧从这里读取，
+    // 因此首选项面板拖动滑块即时生效。
+    private let settings: Settings
+    // 吸附增大：settings.growthRate 为 [0,1] 速率（0 关闭）；黑洞半径随时间从
+    // 当前尺寸渐近逼近上限，模拟持续吞噬桌面而膨胀。上限同时兜住 GPU 采样开销。
     private let maxRadius: Float
     private var currentRadius: Float
     private var lastGrowthTime = CACurrentMediaTime()
@@ -619,12 +668,10 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         Float.random(in: 0 ..< 1000)
     )
 
-    init(view: MTKView, resources: RenderResources, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
-        self.shadowRadius = shadowRadius
-        self.driftSpeed = driftSpeed
-        self.growthRate = growthRate
-        self.currentRadius = shadowRadius
-        // 增大上限对齐到 --size 的最大值：吸附能长到的最大体积，
+    init(view: MTKView, resources: RenderResources, captureSource: ScreenCaptureSource, settings: Settings) throws {
+        self.settings = settings
+        self.currentRadius = settings.radius
+        // 增大上限对齐到尺寸刻度的最大值：吸附能长到的最大体积，
         // 恰好等于手动能设的最大尺寸，概念统一，也兜住重采样 GPU 开销。
         self.maxRadius = BlackHoleSize.maxValue
         let device = resources.device
@@ -708,14 +755,22 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // 逐帧从共享设置读取，令首选项面板拖动滑块即时生效。
+        let growthRate = settings.growthRate
+        let driftSpeed = settings.driftSpeed
         // 吸附增大：按帧间 dt 累积（与帧率无关），半径以指数方式渐近逼近上限。
-        // growthRate 为 0 时保持初始半径不变。
+        // 关闭增大（growthRate 为 0）时，半径直接跟随尺寸滑块，故拖动尺寸即时生效；
+        // 开启增大时，半径从当前值渐近逼近上限，不再受尺寸滑块直接控制。
         let now = CACurrentMediaTime()
         let dt = Float(min(max(now - lastGrowthTime, 0), 0.1))
         lastGrowthTime = now
-        if growthRate > 0 && currentRadius < maxRadius {
-            currentRadius += (maxRadius - currentRadius) * growthRate * dt
-            currentRadius = min(currentRadius, maxRadius)
+        if growthRate > 0 {
+            if currentRadius < maxRadius {
+                currentRadius += (maxRadius - currentRadius) * growthRate * dt
+                currentRadius = min(currentRadius, maxRadius)
+            }
+        } else {
+            currentRadius = settings.radius
         }
 
         // 静止降帧：按全局输入空闲时间判断。距上次鼠标/键盘操作超过 idleThreshold
@@ -765,7 +820,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 private final class BlackHoleView: MTKView {
     private var blackHoleRenderer: BlackHoleRenderer?
 
-    init(blackHoleFrame frame: CGRect, resources: RenderResources, captureSource: ScreenCaptureSource, shadowRadius: Float, driftSpeed: Float, growthRate: Float) throws {
+    init(blackHoleFrame frame: CGRect, resources: RenderResources, captureSource: ScreenCaptureSource, settings: Settings) throws {
         // 复用共享设备，不再逐屏调用 MTLCreateSystemDefaultDevice()
         super.init(frame: frame, device: resources.device)
 
@@ -778,7 +833,7 @@ private final class BlackHoleView: MTKView {
         wantsLayer = true
         layer?.isOpaque = false
 
-        let renderer = try BlackHoleRenderer(view: self, resources: resources, captureSource: captureSource, shadowRadius: shadowRadius, driftSpeed: driftSpeed, growthRate: growthRate)
+        let renderer = try BlackHoleRenderer(view: self, resources: resources, captureSource: captureSource, settings: settings)
         blackHoleRenderer = renderer
         delegate = renderer
     }
@@ -797,16 +852,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureSources: [ScreenCaptureSource] = []
     private var quitHotKey: EventHotKeyRef?
     private var quitHotKeyHandler: EventHandlerRef?
-    private let size = BlackHoleSize.parse(from: CommandLine.arguments)
-    private let driftSpeed = DriftSpeed.parse(from: CommandLine.arguments)
-    private let screenLimit = ScreenCount.parse(from: CommandLine.arguments)
-    private let growthRate = GrowthRate.parse(from: CommandLine.arguments)
+    private var prefsHotKey: EventHotKeyRef?
+    // 运行时可调的共享设置：命令行参数 + UserDefaults 存储值，所有渲染器逐帧读取
+    private let settings = Settings(arguments: CommandLine.arguments)
+    // 首选项面板控制器（懒创建，重复打开复用同一实例）
+    private var preferencesController: PreferencesWindowController?
     // 共享的 Metal 设备与编译好的着色器 library，启动时创建一次，供所有屏幕复用
     private var renderResources: RenderResources?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        registerGlobalQuitHotKey()
+        // 屏幕数量改变需要重建窗口；其余参数逐帧读取，无需重建
+        settings.onScreenLimitChanged = { [weak self] in self?.buildWindows() }
+        registerGlobalHotKeys()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -819,7 +877,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         captureSources.forEach { $0.stop() }
         if let quitHotKey { UnregisterEventHotKey(quitHotKey) }
+        if let prefsHotKey { UnregisterEventHotKey(prefsHotKey) }
         if let quitHotKeyHandler { RemoveEventHandler(quitHotKeyHandler) }
+    }
+
+    // 打开（或前置）首选项面板。由全局热键 ⌃⌥⌘, 触发。
+    func showPreferences() {
+        if preferencesController == nil {
+            preferencesController = PreferencesWindowController(settings: settings)
+        }
+        // accessory 型 App 默认无法接收键盘焦点，临时提为 regular 让面板可交互
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        preferencesController?.showWindow(nil)
+        preferencesController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    // 首选项面板关闭后收回到 accessory，重新隐藏 Dock 图标
+    func preferencesDidClose() {
+        NSApp.setActivationPolicy(.accessory)
     }
 
     @objc private func screensChanged() {
@@ -846,8 +922,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 限制渲染的屏幕数量：默认所有屏幕，--screens N 只取前 N 块
-        let screens = screenLimit.map { Array(NSScreen.screens.prefix($0)) } ?? NSScreen.screens
+        // 限制渲染的屏幕数量：默认所有屏幕，screenLimit 只取前 N 块
+        let screens = settings.screenLimit.map { Array(NSScreen.screens.prefix($0)) } ?? NSScreen.screens
         windows = screens.compactMap { screen in
             do {
                 guard let screenNumber = screen.deviceDescription[
@@ -880,9 +956,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     blackHoleFrame: NSRect(origin: .zero, size: screen.frame.size),
                     resources: resources,
                     captureSource: captureSource,
-                    shadowRadius: size,
-                    driftSpeed: driftSpeed,
-                    growthRate: growthRate
+                    settings: settings
                 )
                 window.orderFrontRegardless()
                 captureSources.append(captureSource)
@@ -904,23 +978,188 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func registerGlobalQuitHotKey() {
+    private func registerGlobalHotKeys() {
+        // 注入首选项热键回调（供 C 热键处理函数调用）
+        openPreferencesAction = { [weak self] in self?.showPreferences() }
+
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let handlerStatus = InstallEventHandler(
             GetApplicationEventTarget(), handleGlobalHotKey, 1, &eventType, nil, &quitHotKeyHandler
         )
         guard handlerStatus == noErr else {
-            fputs("Unable to install the global quit shortcut. Use Control-C in Terminal to exit.\n", stderr)
+            fputs("Unable to install the global shortcuts. Use Control-C in Terminal to exit.\n", stderr)
             return
         }
-        let identifier = EventHotKeyID(signature: quitHotKeySignature, id: quitHotKeyID)
         let modifiers = UInt32(controlKey | optionKey | cmdKey)
-        let hotKeyStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_Period), modifiers, identifier, GetApplicationEventTarget(), 0, &quitHotKey
-        )
-        if hotKeyStatus != noErr {
+
+        // 退出：⌃⌥⌘.
+        let quitID = EventHotKeyID(signature: quitHotKeySignature, id: quitHotKeyID)
+        if RegisterEventHotKey(
+            UInt32(kVK_ANSI_Period), modifiers, quitID, GetApplicationEventTarget(), 0, &quitHotKey
+        ) != noErr {
             fputs("Unable to register Control-Option-Command-Period. Use Control-C in Terminal to exit.\n", stderr)
         }
+
+        // 首选项：⌃⌥⌘,
+        let prefsID = EventHotKeyID(signature: quitHotKeySignature, id: prefsHotKeyID)
+        if RegisterEventHotKey(
+            UInt32(kVK_ANSI_Comma), modifiers, prefsID, GetApplicationEventTarget(), 0, &prefsHotKey
+        ) != noErr {
+            fputs("Unable to register the Control-Option-Command-Comma preferences shortcut.\n", stderr)
+        }
+    }
+}
+
+// 首选项面板：四条滑块（尺寸/速度/屏幕数/增大），拖动即时写回 Settings。
+// Settings 被所有渲染器逐帧读取，故尺寸/速度/增大即时可见；屏幕数变化触发窗口重建。
+@MainActor
+private final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
+    private let settings: Settings
+    private let sizeValueLabel = NSTextField(labelWithString: "")
+    private let speedValueLabel = NSTextField(labelWithString: "")
+    private let growthValueLabel = NSTextField(labelWithString: "")
+    private let screensValueLabel = NSTextField(labelWithString: "")
+
+    init(settings: Settings) {
+        self.settings = settings
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 300),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "黑洞设置"
+        window.isReleasedWhenClosed = false
+        window.center()
+        super.init(window: window)
+        window.delegate = self
+        buildContent()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func buildContent() {
+        guard let window else { return }
+        let content = NSView(frame: window.contentView?.bounds ?? .zero)
+        content.autoresizingMask = [.width, .height]
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+
+        // 屏幕总数（用于把“所有屏幕”映射到滑块最大值）
+        let screenCount = max(1, NSScreen.screens.count)
+
+        stack.addArrangedSubview(makeRow(
+            title: "尺寸", min: 0, max: 10,
+            value: Double(settings.sizeScale), valueLabel: sizeValueLabel,
+            format: { String(format: "%.1f", $0) },
+            action: #selector(sizeChanged(_:))))
+        stack.addArrangedSubview(makeRow(
+            title: "漂移速度", min: 0, max: 10,
+            value: Double(settings.speedScale), valueLabel: speedValueLabel,
+            format: { String(format: "%.1f", $0) },
+            action: #selector(speedChanged(_:))))
+        stack.addArrangedSubview(makeRow(
+            title: "吸附增大", min: 0, max: 10,
+            value: Double(settings.growthScale), valueLabel: growthValueLabel,
+            format: { $0 < 0.05 ? "关闭" : String(format: "%.1f", $0) },
+            action: #selector(growthChanged(_:))))
+        // 屏幕数：1..N，其中 N 表示“所有屏幕”
+        stack.addArrangedSubview(makeRow(
+            title: "屏幕数量", min: 1, max: Double(screenCount),
+            value: Double(settings.screenLimit ?? screenCount), valueLabel: screensValueLabel,
+            format: { v in
+                let n = Int(v.rounded())
+                return n >= screenCount ? "全部" : "\(n)"
+            },
+            action: #selector(screensChangedSlider(_:))))
+
+        let hint = NSTextField(wrappingLabelWithString:
+            "拖动即时生效并自动保存。⌃⌥⌘, 打开本面板，⌃⌥⌘. 退出黑洞。")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(hint)
+
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+        ])
+        window.contentView = content
+    }
+
+    // 一行：标题 + 滑块 + 数值标签
+    private func makeRow(
+        title: String, min: Double, max: Double, value: Double,
+        valueLabel: NSTextField, format: @escaping (Double) -> String, action: Selector
+    ) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.widthAnchor.constraint(equalToConstant: 64).isActive = true
+
+        let slider = NSSlider(value: value, minValue: min, maxValue: max, target: self, action: action)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        valueLabel.stringValue = format(value)
+        valueLabel.alignment = .right
+        valueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        // 用关联的 formatter 更新标签（存到 slider 的 identifier 太脏，改用闭包表）
+        formatters[ObjectIdentifier(slider)] = (valueLabel, format)
+
+        let row = NSStackView(views: [titleLabel, slider, valueLabel])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.alignment = .centerY
+        return row
+    }
+
+    // 每个滑块对应的（数值标签, 格式化闭包）
+    private var formatters: [ObjectIdentifier: (NSTextField, (Double) -> String)] = [:]
+
+    private func updateLabel(for slider: NSSlider) {
+        if let (label, format) = formatters[ObjectIdentifier(slider)] {
+            label.stringValue = format(slider.doubleValue)
+        }
+    }
+
+    @objc private func sizeChanged(_ sender: NSSlider) {
+        settings.sizeScale = Float(sender.doubleValue)
+        updateLabel(for: sender)
+    }
+
+    @objc private func speedChanged(_ sender: NSSlider) {
+        settings.speedScale = Float(sender.doubleValue)
+        updateLabel(for: sender)
+    }
+
+    @objc private func growthChanged(_ sender: NSSlider) {
+        settings.growthScale = Float(sender.doubleValue)
+        updateLabel(for: sender)
+    }
+
+    @objc private func screensChangedSlider(_ sender: NSSlider) {
+        let n = Int(sender.doubleValue.rounded())
+        let total = max(1, NSScreen.screens.count)
+        // 选到最大值视为“全部”（nil），否则限制为前 n 块
+        settings.screenLimit = (n >= total) ? nil : n
+        updateLabel(for: sender)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        (NSApp.delegate as? AppDelegate)?.preferencesDidClose()
     }
 }
 
