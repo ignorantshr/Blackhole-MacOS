@@ -14,7 +14,7 @@
 1. 到本项目的 [Releases 页面](../../releases) 下载最新版本的压缩包，解压得到 `Blackhole.app`。
 2. 把 `Blackhole.app` 拖进「应用程序」文件夹（可选，放哪都能运行）。
 
-请下载与你的 Mac 芯片相符的版本：Apple 芯片（M 系列）或 Intel。不确定的话，点屏幕左上角苹果菜单 →「关于本机」查看。
+需要 Apple 芯片（M 系列）的 Mac，系统 macOS 13 或更新版本。
 
 ## 首次打开
 
