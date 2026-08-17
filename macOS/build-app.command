@@ -59,8 +59,20 @@ PLIST
 echo "==> Ad-hoc 代码签名（让权限授权绑定到稳定身份，重启后仍生效）"
 codesign --force --deep --sign - "$APP_DIR"
 
+# 打包成可上传 GitHub Release 的单个 zip。必须用 ditto 而非普通 zip：
+# ditto 能正确保留 .app 的代码签名与 bundle 结构，普通 zip 可能破坏签名、
+# 导致用户下载后无法打开。文件名带版本号与芯片架构（arm64）。
+ARCH="$(uname -m)"
+ZIP_NAME="$APP_NAME-$VERSION-$ARCH.zip"
+ZIP_PATH="$BUILD_DIR/$ZIP_NAME"
+echo "==> 压缩为 $ZIP_NAME（ditto 保留签名）"
+rm -f "$ZIP_PATH"
+ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+
 echo ""
 echo "完成：$PWD/$APP_DIR（版本 $VERSION）"
 echo "  双击运行，或拖入「应用程序」文件夹。"
 echo "  首次运行请在弹窗中允许「屏幕录制」，然后重新启动。"
 echo "  退出：Control-Option-Command-Period（⌃⌥⌘.）。"
+echo ""
+echo "可上传 GitHub Release 的文件：$PWD/$ZIP_PATH"
