@@ -21,9 +21,7 @@
 因为这个 App 没有经过 Apple 付费开发者签名，首次打开时 macOS 会拦一下，属于正常现象。任选一种方式打开：
 
 - **推荐**：在 `Blackhole.app` 上点右键（或按住 Control 单击）→ 选「打开」→ 在弹窗里再次点「打开」。之后就能像普通 App 一样双击运行。
-- 如果提示「已损坏，应移到废纸篓」，在「终端」里执行一次以下命令即可（把路径换成 App 的实际位置）：
-
-      xattr -dr com.apple.quarantine /Applications/Blackhole.app
+- 如果提示「已损坏，应移到废纸篓」，在「终端」里执行一次 `xattr -dr com.apple.quarantine /Applications/Blackhole.app` 即可（把路径换成 App 的实际位置）。
 
 ## 授权屏幕录制
 
@@ -57,11 +55,8 @@
 
 想自己编译（需已安装 Xcode 或 Command Line Tools）：
 
-    # 直接编译并运行
-    ./macOS/run-overlay.command
-
-    # 或打包成可双击的 Blackhole.app（产物在 macOS/.build/）
-    ./macOS/build-app.command
+- 直接编译并运行：`./macOS/run-overlay.command`
+- 或打包成可双击的 Blackhole.app（产物在 `macOS/.build/`）：`./macOS/build-app.command`
 
 命令行运行时也可传入初始参数，例如 `./macOS/run-overlay.command --size 8 --speed 6 --screens 1`，取值均为 `0-10` 刻度（屏幕数量为整数）。这些参数与设置面板等价，会作为初始值写入设置。
 
