@@ -6,6 +6,8 @@ cd "$(dirname "$0")"
 
 APP_NAME="Blackhole"
 BUNDLE_ID="com.ignorantshr.blackhole"
+# 版本号：发版时只改这一处，会写入 App 的 Info.plist（也建议同步打一个 git tag v$VERSION）
+VERSION="1.0.0"
 BUILD_DIR=".build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
@@ -39,9 +41,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <!-- 后台附件型 App：不占用程序坞图标，与 setActivationPolicy(.accessory) 对应 -->
@@ -58,7 +60,7 @@ echo "==> Ad-hoc 代码签名（让权限授权绑定到稳定身份，重启后
 codesign --force --deep --sign - "$APP_DIR"
 
 echo ""
-echo "完成：$PWD/$APP_DIR"
+echo "完成：$PWD/$APP_DIR（版本 $VERSION）"
 echo "  双击运行，或拖入「应用程序」文件夹。"
 echo "  首次运行请在弹窗中允许「屏幕录制」，然后重新启动。"
 echo "  退出：Control-Option-Command-Period（⌃⌥⌘.）。"
