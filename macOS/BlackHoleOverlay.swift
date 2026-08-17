@@ -47,7 +47,9 @@ private struct RenderUniforms {
     var radius: Float
     var screenResolution: SIMD2<Float>
     var seed: SIMD2<Float>
-    var driftSpeed: Float
+    // 漂移相位（CPU 逐帧按 dt×速度 累积）。用累积相位而非 time×速度，
+    // 避免拖动速度滑块时黑洞位置瞬间跳变。
+    var driftPhase: Float
 }
 
 // 从命令行读取某个 0-10 刻度参数：存在且可解析时返回截断到 [0,10] 的刻度值，
@@ -654,6 +656,11 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private let maxRadius: Float
     private var currentRadius: Float
     private var lastGrowthTime = CACurrentMediaTime()
+    // 漂移相位：逐帧按 dt × 当前速度累积，而不是用“绝对时间 × 速度”。
+    // 后者在运行中改速度会把已累积的全部历史时间瞬间重解释，导致黑洞位置跳变；
+    // 累积相位则只改变之后的推进快慢，已走过的轨迹不动，拖动速度滑块平滑过渡。
+    private var driftPhase: Float = 0
+    private var lastDriftTime = CACurrentMediaTime()
     // 输入空闲降帧：用户超过 idleThreshold 秒无鼠标/键盘操作时降到 idleFPS 省电，
     // 一有输入立刻回到 activeFPS。黑洞漂移与吸积盘旋转是时间驱动的，降帧只影响
     // 平滑度、不改变动画速度，因此空闲时仍连续动，只是每秒少渲染几帧。
@@ -764,6 +771,10 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         let now = CACurrentMediaTime()
         let dt = Float(min(max(now - lastGrowthTime, 0), 0.1))
         lastGrowthTime = now
+        // 漂移相位按 dt×速度 逐帧累积，而不是 time×速度。后者在拖动速度滑块时会把
+        // 已累积的时间历史整体重新解释，导致黑洞位置瞬间跳变；累积相位则只改变此后的
+        // 推进快慢，已走过的轨迹不动，改速度平滑无跳变。
+        driftPhase += dt * driftSpeed
         if growthRate > 0 {
             if currentRadius < maxRadius {
                 currentRadius += (maxRadius - currentRadius) * growthRate * dt
@@ -799,7 +810,7 @@ private final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             radius: currentRadius,
             screenResolution: SIMD2(capturedWidth, capturedHeight),
             seed: seed,
-            driftSpeed: driftSpeed
+            driftPhase: driftPhase
         )
 
         encoder.setRenderPipelineState(pipelineState)

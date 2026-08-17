@@ -89,7 +89,7 @@ struct RenderUniforms {
     float radius;
     float2 screenResolution;
     float2 seed;        // 每块屏幕独立的随机相位，令漂移轨迹各不相同且不同步
-    float driftSpeed;   // 黑洞漂移速度倍率，仅影响漫游，不影响吸积盘转速
+    float driftPhase;   // CPU 侧逐帧累积的漂移相位（∫速度 dt），改速度不跳变
 };
 
 struct VertexOutput {
@@ -309,8 +309,9 @@ fragment float4 blackHoleFragment(
     bool hasScreen = all(uniforms.screenResolution > 0.0);
     // time 为原始时间，驱动吸积盘旋转等物理动画，不受漂移速度影响
     float time = uniforms.time;
-    // 漫游用的时间轴：基础漂移速度 × 用户可调倍率
-    float driftClock = uniforms.time * kDriftSpeed * uniforms.driftSpeed;
+    // 漫游用的时间轴：CPU 已把“用户速度倍率×dt”逐帧累积进 driftPhase，
+    // 这里只再乘基础漂移速度。改速度只影响此后推进快慢，不会重解释历史、不跳变。
+    float driftClock = uniforms.driftPhase * kDriftSpeed;
 
     // 盘的径向范围做一次保护：内边缘保持在光子球（1.5 r_s）之外，
     // 在光子球以内圆轨道已不再有物理意义
