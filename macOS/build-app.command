@@ -6,8 +6,22 @@ cd "$(dirname "$0")"
 
 APP_NAME="Blackhole"
 BUNDLE_ID="com.ignorantshr.blackhole"
-# 版本号：发版时只改这一处，会写入 App 的 Info.plist（也建议同步打一个 git tag v$VERSION）
-VERSION="1.0.0"
+
+# 版本号来源（优先级从高到低）：
+#   1) 环境变量 VERSION（如 VERSION=1.2.0 ./build-app.command，用于非 git 环境或临时覆盖）
+#   2) git 最近的 v* tag（发版标准流程：打 git tag v1.2.0，此处自动解析出 1.2.0）
+#   3) 兜底 0.0.0-dev（无 git 或无 tag 时）
+# HEAD 若在 tag 之后还有提交，git describe 会得到 1.2.0-3-gabc123 这类后缀，
+# 提示当前是“某发布版之后的开发构建”，便于区分正式发布与本地临时打包。
+if [[ -z "${VERSION:-}" ]]; then
+  VERSION="$(git describe --tags --match 'v*' --dirty 2>/dev/null | sed 's/^v//')"
+fi
+: "${VERSION:=0.0.0-dev}"
+# CFBundleShortVersionString 只接受形如 x.y.z 的纯数字版本，取版本号的第一段
+# （去掉 -3-gabc123 / -dirty 等后缀）；完整字符串保留给 CFBundleVersion 做构建标识。
+SHORT_VERSION="${VERSION%%-*}"
+: "${SHORT_VERSION:=0.0.0}"
+
 BUILD_DIR=".build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
@@ -43,7 +57,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
-    <string>$VERSION</string>
+    <string>$SHORT_VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <!-- 后台附件型 App：不占用程序坞图标，与 setActivationPolicy(.accessory) 对应 -->
